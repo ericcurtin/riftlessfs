@@ -9,13 +9,30 @@
 //! against OrbStack once the transport exists).
 //!
 //! Run with: `cargo bench -p riftlessfs-bench`
+//!
+//! `riftlessfs_core::PassthroughFs` only exists on Unix (see
+//! `PASSTHROUGH_SUPPORTED`), so everything below is individually
+//! `cfg(unix)`-gated, with a trivial fallback `main` elsewhere.
+//! `harness = false` (see Cargo.toml) means *we* have to supply `fn main`
+//! (via `criterion_main!` below), unlike a plain `#[test]` binary where an
+//! entirely `#![cfg(unix)]`-gated file still gets an auto-generated one --
+//! so, unlike `tests/passthrough.rs`, this can't just be gated as a whole.
 
+#[cfg(not(unix))]
+fn main() {}
+
+#[cfg(unix)]
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+#[cfg(unix)]
 use riftlessfs_core::{PassthroughFs, ROOT_ID};
+#[cfg(unix)]
 use std::ffi::OsStr;
+#[cfg(unix)]
 use std::hint::black_box;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 
+#[cfg(unix)]
 fn bench_getattr(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("f"), b"data").unwrap();
@@ -32,6 +49,7 @@ fn bench_getattr(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_lookup(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("f"), b"data").unwrap();
@@ -51,6 +69,7 @@ fn bench_lookup(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_read_4k(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
     let payload = vec![0xABu8; 4096];
@@ -84,6 +103,7 @@ fn bench_read_4k(c: &mut Criterion) {
     unsafe { libc::close(raw_fd) };
 }
 
+#[cfg(unix)]
 fn bench_write_4k(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
     let payload = vec![0xABu8; 4096];
@@ -116,6 +136,7 @@ fn bench_write_4k(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 criterion_group!(
     benches,
     bench_getattr,
@@ -123,4 +144,5 @@ criterion_group!(
     bench_read_4k,
     bench_write_4k
 );
+#[cfg(unix)]
 criterion_main!(benches);

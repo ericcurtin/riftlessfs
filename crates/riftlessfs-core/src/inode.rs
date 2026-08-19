@@ -23,6 +23,10 @@ pub enum FileKind {
 }
 
 impl FileKind {
+    // `libc::S_IF*` constants have platform-dependent widths (e.g. `u16`
+    // on macOS vs already-`u32` on Linux/glibc), so `as u32` is meaningful
+    // on some targets and a harmless no-op on others.
+    #[allow(clippy::unnecessary_cast)]
     pub fn from_mode(mode: u32) -> Self {
         match mode & libc::S_IFMT as u32 {
             m if m == libc::S_IFDIR as u32 => FileKind::Dir,
@@ -82,6 +86,10 @@ pub struct InodeStore {
 }
 
 impl InodeStore {
+    // `st_dev`/`st_mode` widths vary by platform (e.g. `dev_t` is `i32` on
+    // macOS but already `u64` on Linux/glibc), so these casts are
+    // meaningful on some targets and a harmless no-op on others.
+    #[allow(clippy::unnecessary_cast)]
     pub fn new(root_fd: OwnedFd, root_stat: &libc::stat) -> Self {
         let root = std::sync::Arc::new(InodeData {
             id: ROOT_ID,
@@ -118,6 +126,7 @@ impl InodeStore {
     /// Register a freshly-opened child (or dedup onto an existing inode if
     /// this file is already known, e.g. via a hard link or a previous
     /// lookup), bumping its lookup refcount by one either way.
+    #[allow(clippy::unnecessary_cast)]
     pub fn register(
         &self,
         parent: u64,
@@ -206,6 +215,7 @@ impl InodeStore {
 
 /// Open a child of `parent_fd` and stat it, choosing the minimal-privilege
 /// open flags appropriate for its type (see `platform` module docs).
+#[allow(clippy::unnecessary_cast)]
 pub fn open_child(parent_fd: RawFd, name: &std::ffi::CStr) -> FsResult<(OwnedFd, libc::stat)> {
     use std::os::fd::FromRawFd;
 

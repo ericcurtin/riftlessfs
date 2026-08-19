@@ -33,6 +33,11 @@ pub struct Attr {
 
 impl Attr {
     #[cfg(unix)]
+    // `libc::stat` field widths vary by platform (e.g. `st_mode` is `u16`
+    // on macOS but already `u32` on Linux/glibc), so these casts are
+    // meaningful on some targets and genuinely redundant (but harmless) on
+    // others -- not the "same type" bug clippy's lint is meant to catch.
+    #[allow(clippy::unnecessary_cast)]
     pub(crate) fn from_stat(st: &libc::stat) -> Self {
         Attr {
             ino: st.st_ino,

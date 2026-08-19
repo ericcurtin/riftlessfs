@@ -44,18 +44,12 @@ jobs:
       - name: cargo build --workspace
         run: cargo build --workspace --all-targets
 
-      # riftlessfs-core's real filesystem engine (and its integration tests)
-      # only compile on Unix hosts today -- see crates/riftlessfs-core's
-      # README/PASSTHROUGH_SUPPORTED doc comment. Windows jobs above still
-      # build the whole workspace (everything must at least compile there)
-      # but skip running tests that don't exist on that platform.
+      # riftlessfs-core's real filesystem engine only compiles on Unix
+      # hosts today (see PASSTHROUGH_SUPPORTED / the workspace README);
+      # its integration test file is `#![cfg(unix)]`-gated so it still
+      # builds (as an empty test binary) and runs (0 tests) on Windows.
       - name: cargo test --workspace
-        if: runner.os != 'Windows'
         run: cargo test --workspace
-
-      - name: cargo test --workspace (portable subset)
-        if: runner.os == 'Windows'
-        run: cargo test --workspace --lib
 
       - name: cargo clippy --workspace
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -72,5 +66,5 @@ jobs:
       # to completion.
       - name: cargo bench --no-run, then a short real run
         run: |
-          cargo bench -p riftlessfs-bench --no-run
-          cargo bench -p riftlessfs-bench -- --measurement-time 1 --warm-up-time 1 --sample-size 10
+          cargo bench -p riftlessfs-bench --bench core_ops --no-run
+          cargo bench -p riftlessfs-bench --bench core_ops -- --measurement-time 1 --warm-up-time 1 --sample-size 10

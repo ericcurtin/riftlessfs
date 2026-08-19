@@ -2,6 +2,11 @@
 //! directory on whatever filesystem the test runner uses (APFS on macOS,
 //! ext4/btrfs/tmpfs on Linux CI). These exercise the actual syscalls, not
 //! mocks.
+//!
+//! `riftlessfs_core::PassthroughFs` only exists on Unix (see
+//! `PASSTHROUGH_SUPPORTED`), so this whole file compiles to nothing on
+//! other platforms rather than failing to build there.
+#![cfg(unix)]
 
 use riftlessfs_core::{PassthroughFs, SetAttr, ROOT_ID};
 use std::ffi::OsStr;

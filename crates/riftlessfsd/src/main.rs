@@ -1,27 +1,24 @@
-use clap::Parser;
-use std::path::PathBuf;
-
 /// riftlessfs daemon: a userspace virtio-fs backend.
 ///
 /// Status: the passthrough filesystem engine (`riftlessfs-core`) is
 /// functional and unit-tested; the vhost-user transport
 /// (`riftlessfs-proto`) is still a work in progress, so `serve` currently
 /// exits with an error. See the workspace README for the roadmap.
-#[derive(Parser, Debug)]
+#[cfg(unix)]
+#[derive(clap::Parser, Debug)]
 #[command(name = "riftlessfsd", version, about)]
 struct Args {
     /// Directory to share with the guest.
     #[arg(long)]
-    shared_dir: PathBuf,
+    shared_dir: std::path::PathBuf,
 
     /// Path to the vhost-user UNIX domain socket to listen on.
     #[arg(long)]
-    socket_path: PathBuf,
+    socket_path: std::path::PathBuf,
 }
 
 fn main() {
     env_logger::init();
-    let args = Args::parse();
 
     if !riftlessfs_core::PASSTHROUGH_SUPPORTED {
         eprintln!("riftlessfsd: this platform is not yet supported (see README)");
@@ -30,6 +27,8 @@ fn main() {
 
     #[cfg(unix)]
     {
+        use clap::Parser;
+        let args = Args::parse();
         match riftlessfs_core::PassthroughFs::new(&args.shared_dir) {
             Ok(_fs) => {
                 log::info!(

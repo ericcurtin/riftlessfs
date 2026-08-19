@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/riftlessfs-core",
+    "crates/riftlessfs-proto",
+    "crates/riftlessfsd",
+    "crates/riftlessfs-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/ericcurtin/riftlessfs"
+rust-version = "1.75"
+
+[workspace.dependencies]
+libc = "0.2"
+nix = { version = "0.29", features = ["fs", "dir", "mman", "socket", "uio"] }
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
+criterion = "0.5"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+lto = true

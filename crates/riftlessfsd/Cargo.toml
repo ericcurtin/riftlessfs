@@ -1,0 +1,18 @@
+[package]
+name = "riftlessfsd"
+description = "riftlessfs daemon binary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "riftlessfsd"
+path = "src/main.rs"
+
+[dependencies]
+riftlessfs-core = { path = "../riftlessfs-core" }
+riftlessfs-proto = { path = "../riftlessfs-proto" }
+clap = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }

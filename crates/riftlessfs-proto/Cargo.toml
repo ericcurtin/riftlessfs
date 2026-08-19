@@ -1,0 +1,12 @@
+[package]
+name = "riftlessfs-proto"
+description = "Portable vhost-user / virtio-fs wire protocol implementation for riftlessfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libc = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }

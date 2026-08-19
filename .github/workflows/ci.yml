@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-aarch64
+            os: macos-14
+          - name: linux-x86_64
+            os: ubuntu-24.04
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+          - name: windows-x86_64
+            os: windows-latest
+          - name: windows-aarch64
+            os: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo build --workspace
+        run: cargo build --workspace --all-targets
+
+      # riftlessfs-core's real filesystem engine (and its integration tests)
+      # only compile on Unix hosts today -- see crates/riftlessfs-core's
+      # README/PASSTHROUGH_SUPPORTED doc comment. Windows jobs above still
+      # build the whole workspace (everything must at least compile there)
+      # but skip running tests that don't exist on that platform.
+      - name: cargo test --workspace
+        if: runner.os != 'Windows'
+        run: cargo test --workspace
+
+      - name: cargo test --workspace (portable subset)
+        if: runner.os == 'Windows'
+        run: cargo test --workspace --lib
+
+      - name: cargo clippy --workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  bench-smoke:
+    name: bench-smoke (macos-aarch64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Not a perf gate (shared CI runners are too noisy for that) -- just
+      # makes sure the benchmark harness itself keeps compiling and running
+      # to completion.
+      - name: cargo bench --no-run, then a short real run
+        run: |
+          cargo bench -p riftlessfs-bench --no-run
+          cargo bench -p riftlessfs-bench -- --measurement-time 1 --warm-up-time 1 --sample-size 10

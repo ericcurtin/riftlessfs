@@ -1,0 +1,20 @@
+[package]
+name = "riftlessfs-bench"
+description = "Benchmarks for riftlessfs-core, and scripts to compare full-stack performance against OrbStack/virtiofsd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+riftlessfs-core = { path = "../riftlessfs-core" }
+libc = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tempfile = { workspace = true }
+
+[[bench]]
+name = "core_ops"
+harness = false

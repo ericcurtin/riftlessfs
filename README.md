@@ -5,11 +5,14 @@ into a Linux guest VM, with the goal of beating OrbStack's bind-mount
 performance on macOS, Linux, and Windows hosts.
 
 **Status: early days.** The passthrough filesystem engine is real,
-unit-tested, and benchmarked (see below). The actual transport that would
-let a VM talk to it (vhost-user / virtio-fs) is not implemented yet. There
-is no working end-to-end mount today, and no benchmark results against
-OrbStack yet. This README is deliberately explicit about that so nobody
-mistakes "the engine works" for "this beats OrbStack" -- it doesn't, yet.
+unit-tested, and benchmarked (see below). The vhost-user wire protocol's
+message framing (headers, payloads, `SCM_RIGHTS` socket transport) is also
+real and tested, but the parts that would make it *useful* -- mapping
+guest memory, parsing virtqueues, decoding FUSE-over-virtio requests, and
+dispatching them into the engine -- aren't implemented yet. There is no
+working end-to-end mount today, and no benchmark results against OrbStack
+yet. This README is deliberately explicit about that so nobody mistakes
+"the engine works" for "this beats OrbStack" -- it doesn't, yet.
 
 ## Why this is hard, and what "beating OrbStack" actually requires
 
@@ -47,16 +50,38 @@ Two things became clear from research before writing any code:
 
 Given that, the plan is split into phases:
 
-- **Phase 1 (this repo, in progress):** a transport-agnostic passthrough
-  filesystem *engine* (`riftlessfs-core`) that's correct and fast in
-  isolation, portable to Linux and macOS today.
-- **Phase 2 (not started):** a hand-rolled, portable subset of the
+- **Phase 1 (done):** a transport-agnostic passthrough filesystem *engine*
+  (`riftlessfs-core`) that's correct and fast in isolation, portable to
+  Linux and macOS today.
+- **Phase 2 (in progress):** a hand-rolled, portable subset of the
   vhost-user + virtio-fs (FUSE-over-virtio) wire protocol
   (`riftlessfs-proto`) that avoids the Linux-only pieces of the rust-vmm
-  stack -- UNIX-domain-socket + `SCM_RIGHTS` fd passing + `mmap` all work
-  on both Linux and macOS; the main remaining gap is `eventfd`-shaped
-  "kick"/"call" doorbells, which can be emulated with a self-pipe on
-  platforms without a native eventfd.
+  stack.
+  - *Done:* message header/payload (de)serialization for the requests
+    needed to negotiate features and set up vrings (`GET/SET_FEATURES`,
+    `GET/SET_PROTOCOL_FEATURES`, `SET_MEM_TABLE`, `SET_VRING_*`,
+    `GET_QUEUE_NUM`); a `SCM_RIGHTS`-aware socket transport on top of
+    `std::os::unix::net::UnixStream` + the [`sendfd`](https://docs.rs/sendfd)
+    crate (confirmed working for both plain messages and fd-passing, on
+    macOS, via real `UnixStream::pair()` round-trip tests); and a portable
+    `Doorbell` type. One correction to the original plan: the "`eventfd`
+    doesn't exist on macOS" gap turned out not to block the main kick/call
+    notification path at all -- those fds are *created by the front-end*
+    and handed to us, so we only ever need generic POSIX
+    read/write/poll on them, regardless of what kind of fd they are.
+    `Doorbell` ended up useful only for internal coordination and for
+    simulating a front-end in tests.
+  - *Not done yet (the bulk of the remaining effort):* actually mapping
+    the memory regions a `SET_MEM_TABLE` request hands us (`mmap`-ing the
+    passed fds and translating guest physical addresses), parsing the
+    split-virtqueue layout (descriptor table / avail ring / used ring) out
+    of that mapped memory, defining the FUSE-over-virtio wire structs
+    (`fuse_in_header`/`fuse_out_header` and per-opcode payloads matching
+    Linux's `fuse.h`), and a dispatch loop wiring decoded requests into
+    `riftlessfs-core::PassthroughFs`. None of this can be meaningfully
+    tested without at least a fake virtqueue in guest-like memory, and
+    real confidence needs an actual VMM (QEMU, or Apple's
+    Virtualization.framework via a custom bridge) on the other end.
 - **Phase 3 (not started):** a Windows transport. Likely a custom protocol
   over Hyper-V sockets rather than vhost-user, since vhost-user itself
   isn't viable there. Scope/approach TBD.
@@ -70,7 +95,9 @@ Anyone continuing this work should read this section before assuming the
 vhost-user transport is a small remaining step; it's most of the actual
 engineering effort.
 
-## What's implemented today: `riftlessfs-core`
+## What's implemented today
+
+### `riftlessfs-core`
 
 `crates/riftlessfs-core` is a transport-agnostic passthrough filesystem
 engine. Given a "shared directory," it implements lookup, getattr,
@@ -92,6 +119,20 @@ platforms.
 
 It is **Unix-only for now** (`riftlessfs_core::PASSTHROUGH_SUPPORTED` is
 `false` on Windows); see Phase 3 above.
+
+### `riftlessfs-proto`
+
+`crates/riftlessfs-proto` implements the vhost-user message framing layer:
+the 12-byte header, payload structs for feature/protocol-feature
+negotiation and vring setup, and a `Connection` type over
+`UnixStream` that correctly attaches/receives `SCM_RIGHTS` file
+descriptors alongside message bytes (tested with a real fd round-trip,
+not just byte layout). See the crate's module docs
+(`crates/riftlessfs-proto/src/lib.rs` and `vhost_user/mod.rs`) for exactly
+what is and isn't implemented -- in short, this crate can speak the
+handshake, but can't yet serve an actual filesystem request. It is
+**Unix-only** (`riftlessfs_proto::VHOST_USER_SUPPORTED` is `false` on
+Windows) for the same fd-passing reason as above.
 
 ### Testing
 
@@ -119,7 +160,7 @@ OrbStack comparisons belong.
 ```
 crates/
   riftlessfs-core   passthrough filesystem engine (Phase 1, implemented)
-  riftlessfs-proto  vhost-user/virtio-fs wire protocol (Phase 2, not implemented)
+  riftlessfs-proto  vhost-user/virtio-fs wire protocol (Phase 2, partial: framing done, virtqueue/FUSE dispatch not)
   riftlessfsd       daemon binary wiring the above together
   riftlessfs-bench  criterion benchmarks + (future) full-stack benchmark scripts
 ```
@@ -133,7 +174,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 ```
 
-CI (`.github/workflows/ci.yml`) builds and clippy-checks the workspace on
-macOS (aarch64), Linux (x86_64/aarch64), and Windows (x86_64/aarch64), and
-runs the full test suite everywhere except Windows (where
-`riftlessfs-core`'s real engine isn't compiled in yet).
+CI (`.github/workflows/ci.yml`) builds, tests, and clippy-checks the
+workspace on macOS (aarch64), Linux (x86_64/aarch64), and Windows
+(x86_64/aarch64). On Windows, `riftlessfs-core`/`riftlessfs-proto`'s real
+implementations aren't compiled in (their test files are
+`#![cfg(unix)]`-gated), so those crates' tests pass trivially there (0
+run) rather than being skipped outright -- everything still has to build
+cleanly on all five targets.

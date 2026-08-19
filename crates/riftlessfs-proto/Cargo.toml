@@ -10,3 +10,12 @@ repository.workspace = true
 libc = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# vhost-user is a UNIX-domain-socket protocol that relies on SCM_RIGHTS
+# ancillary-data fd passing (for shared memory + doorbell fds), which
+# doesn't exist on Windows sockets -- see the workspace README. `sendfd`
+# wraps the sendmsg/recvmsg + CMSG boilerplate portably across Linux and
+# macOS so we don't have to hand-roll it (verified working on both in
+# development).
+sendfd = "0.4"

@@ -32,28 +32,52 @@ cleanup() {
 
 log() { echo "[qemu-integration-test] $*" >&2; }
 
+
+# Find the first existing file among several candidates. Ubuntu's OVMF/
+# AAVMF packaging has changed the exact firmware filenames across
+# releases (e.g. plain "OVMF_CODE.fd" vs. the newer 4M-flash-sized
+# "OVMF_CODE_4M.fd"), so probe for what's actually there rather than
+# hardcoding one path.
+first_existing() {
+  for f in "$@"; do
+    if [ -e "$f" ]; then
+      echo "$f"
+      return 0
+    fi
+  done
+  return 1
+}
+
 case "$ARCH" in
   x86_64)
     QEMU_BIN=qemu-system-x86_64
     FEDORA_ARCH=x86_64
     MACHINE=q35
     ACCEL_KVM="-accel kvm"
-    FIRMWARE_CODE=/usr/share/OVMF/OVMF_CODE.fd
-    FIRMWARE_VARS_SRC=/usr/share/OVMF/OVMF_VARS.fd
+    FIRMWARE_CODE="$(first_existing /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/ovmf/OVMF.fd)"
+    FIRMWARE_VARS_SRC="$(first_existing /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd)"
     ;;
   aarch64|arm64)
     QEMU_BIN=qemu-system-aarch64
     FEDORA_ARCH=aarch64
     MACHINE="virt,gic-version=max"
     ACCEL_KVM="-accel kvm -cpu host"
-    FIRMWARE_CODE=/usr/share/AAVMF/AAVMF_CODE.fd
-    FIRMWARE_VARS_SRC=/usr/share/AAVMF/AAVMF_VARS.fd
+    FIRMWARE_CODE="$(first_existing /usr/share/AAVMF/AAVMF_CODE.fd /usr/share/qemu-efi-aarch64/QEMU_EFI.fd)"
+    FIRMWARE_VARS_SRC="$(first_existing /usr/share/AAVMF/AAVMF_VARS.fd /usr/share/qemu-efi-aarch64/vars-template-pflash.raw)"
     ;;
   *)
     echo "unsupported architecture: $ARCH" >&2
     exit 1
     ;;
 esac
+
+if [ -z "$FIRMWARE_CODE" ] || [ -z "$FIRMWARE_VARS_SRC" ]; then
+  echo "could not locate UEFI firmware (OVMF/AAVMF) files; searched standard package locations" >&2
+  echo "looked under /usr/share/OVMF, /usr/share/ovmf, /usr/share/AAVMF, /usr/share/qemu-efi-aarch64" >&2
+  find /usr/share -iname '*ovmf*' -o -iname '*aavmf*' -o -iname '*qemu-efi*' 2>/dev/null >&2 || true
+  exit 1
+fi
+log "using firmware code=$FIRMWARE_CODE vars=$FIRMWARE_VARS_SRC"
 
 if [ ! -e /dev/kvm ]; then
   log "warning: /dev/kvm not available, falling back to TCG (much slower)"

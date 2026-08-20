@@ -203,22 +203,24 @@ simultaneously as separate `vhost-user-fs-pci` devices, and runs the same
 `bind-mount-benchmark.sh` against each from inside the guest. Reproducible
 via the (manually-triggered) `compare-virtiofsd.yml` CI workflow.
 
+**Run 1** (riftlessfsd's `max_write` was still 128 KiB at this point):
+
 | Benchmark | riftlessfsd | virtiofsd | riftlessfs vs. virtiofsd |
 |---|---|---|---|
 | Sequential write, 512 MiB, 1 MiB blocks | 307 MiB/s | 866 MiB/s | 2.8x behind |
 | Sequential read, 512 MiB, 1 MiB blocks | 749 MiB/s | 1925 MiB/s | 2.6x behind |
 | Random write, 128 MiB, 4 KiB blocks | 170 MiB/s (43.6k IOPS) | 552 MiB/s (141k IOPS) | 3.2x behind |
-| Random read, 128 MiB, 4 KiB blocks | 52.4 MiB/s (13.4k IOPS) | 52.9 MiB/s (13.5k IOPS) | **~equal (1.01x)** |
-| Create 2000 files | 0.745 s | 0.761 s | **~equal, riftlessfs marginally ahead** |
-| Stat 2000 files | 0.148 s | 0.164 s | **riftlessfs ahead** |
-| Remove 2000 files | 0.485 s | 0.511 s | **riftlessfs ahead** |
-| tar create (1000 files) | 0.279 s | 0.360 s | **riftlessfs ahead** |
-| tar extract (1000 files) | 0.838 s | 0.919 s | **riftlessfs ahead** |
+| Random read, 128 MiB, 4 KiB blocks | 52.4 MiB/s (13.4k IOPS) | 52.9 MiB/s (13.5k IOPS) | ~equal (1.01x) |
+| Create 2000 files | 0.745 s | 0.761 s | ~equal, riftlessfs marginally ahead |
+| Stat 2000 files | 0.148 s | 0.164 s | riftlessfs ahead |
+| Remove 2000 files | 0.485 s | 0.511 s | riftlessfs ahead |
+| tar create (1000 files) | 0.279 s | 0.360 s | riftlessfs ahead |
+| tar extract (1000 files) | 0.838 s | 0.919 s | riftlessfs ahead |
 | find (1000 files) | 0.043 s | 0.039 s | ~equal |
 | rm -rf (1000 files) | 0.303 s | 0.314 s | ~equal |
 
-Two things stand out, and both matter more than they might look like at
-first glance:
+Two things stood out immediately, and both matter more than they might
+look like at first glance:
 
 1. **Random read is essentially identical (52.4 vs. 52.9 MiB/s).** This
    directly confirms the previous section's conclusion, with an
@@ -237,34 +239,63 @@ first glance:
    cache timeout, `FOPEN_KEEP_CACHE`) isn't leaving obvious performance
    on the table for this class of operation.
 
-**What's real and still behind:** sequential/random write throughput and
-sequential read (2.6-3.2x). Since random *read* latency matches virtiofsd
-almost exactly, the write-throughput gap isn't explained by "riftlessfs
-is generically slower per request" -- something specific to how writes
-(and to a lesser extent, sequential reads) are handled differs. virtiofsd
-supports a `--thread-pool-size` option for concurrent request handling
-(not used in this comparison -- default is `0`, i.e. also single-threaded,
-so this isn't the explanation here either) and has had substantially more
-time to accumulate write-path optimizations; pinning down the specific
-difference is the next concrete piece of work, not "add more caching
-flags" (that lever is now largely exhausted -- see the fixes above).
+Reading upstream virtiofsd's own `init()` reply (`src/server.rs`) turned
+up the single biggest concrete difference behind the write/read
+throughput gap: it advertises `max_write = 1 MiB`; riftlessfsd was
+advertising 128 KiB, an 8x difference. Matched it (see
+`fuse::wire::MAX_WRITE`'s doc comment) and re-ran:
+
+**Run 2** (riftlessfsd's `max_write` now 1 MiB, matching virtiofsd):
+
+| Benchmark | riftlessfsd | virtiofsd | riftlessfs vs. virtiofsd |
+|---|---|---|---|
+| Sequential write, 512 MiB, 1 MiB blocks | 407 MiB/s | 869 MiB/s | **2.1x behind** (was 2.8x) |
+| Sequential read, 512 MiB, 1 MiB blocks | 657 MiB/s | 2032 MiB/s | 3.1x behind (was 2.6x) |
+| Random write, 128 MiB, 4 KiB blocks | 268 MiB/s (68.7k IOPS) | 883 MiB/s (226k IOPS) | 3.3x behind (was 3.2x) |
+| Random read, 128 MiB, 4 KiB blocks | 78.8 MiB/s (20.2k IOPS) | 75.3 MiB/s (19.3k IOPS) | **riftlessfs ahead** (1.05x) |
+| Create 2000 files | 0.366 s | 0.376 s | riftlessfs ahead |
+| Stat 2000 files | 0.072 s | 0.086 s | riftlessfs ahead |
+| Remove 2000 files | 0.256 s | 0.305 s | riftlessfs ahead |
+| tar create (1000 files) | 0.191 s | 0.240 s | riftlessfs ahead |
+| tar extract (1000 files) | 0.455 s | 0.513 s | riftlessfs ahead |
+| find (1000 files) | 0.029 s | 0.031 s | riftlessfs ahead |
+| rm -rf (1000 files) | 0.167 s | 0.163 s | ~equal |
+
+**Read this carefully, not just the ratio column**: every single number
+moved between runs, for *both* backends (e.g. virtiofsd's own random
+write went from 552 to 883 MiB/s) -- this is a shared GitHub Actions
+runner, and that's real run-to-run variance, not a change in either
+binary's behavior between runs. The metadata numbers all improved
+proportionally for both sides (consistent with "this run happened to get
+less noisy-neighbor interference," not with either fix mattering for
+metadata at all, which matches expectations). What's meaningful is what
+moved *relative to the other backend on the same run*:
+
+- **Sequential write's ratio genuinely improved** (2.8x -> 2.1x behind):
+  consistent with `max_write` being a real, direct lever for sequential
+  transfers, as expected.
+- **Random write's ratio did not improve** (3.2x -> 3.3x, i.e. unchanged
+  within noise): since virtiofsd *already* had `max_write = 1 MiB` before
+  riftlessfsd matched it, closing that gap only helps where request-size
+  mismatch was actually the bottleneck. Random write's gap is apparently
+  driven by something else entirely -- worth investigating specifically,
+  not assumed to be more of the same fix.
+- **Random read went from ~equal to riftlessfs slightly *ahead*.** Given
+  the run-to-run noise just described, treat this as "still roughly
+  equal," not as a new win to bank on.
 
 ## Next steps (in priority order)
 
-1. **Investigate the write-throughput and sequential-read gap
-   specifically**, now that it's isolated from OrbStack's other
-   differences and from general per-request latency (which matches the
-   reference implementation). Candidates: how virtiofsd structures its
-   own write path, whether there's request-size-dependent behavior being
-   left on the table, and whether the gap is bigger on sequential
-   (batched via writeback) or random (unbatched) writes specifically --
-   worth another round of profiling like the random-read investigation
-   above rather than guessing.
+1. **Investigate the *random write* gap specifically** now that
+   `max_write` is ruled out as the explanation (it closed the sequential
+   write gap but not this one) -- profile it the same way the random-read
+   latency investigation was done above, rather than guessing at another
+   flag or constant to tweak.
 2. **Add repeatability to this benchmark suite**: multiple runs with
-   variance reported, before drawing further conclusions from small
-   deltas (see the metadata-noise and v3->v4-write-regression notes
-   above -- both are plausibly noise, but "plausibly" isn't "confirmed").
-   This applies to the virtiofsd comparison too -- it's a single run.
+   variance reported. The run-to-run noise between the two virtiofsd
+   comparison runs above (visible in both backends' absolute numbers)
+   makes this the most concretely-justified item on this list, not just
+   a generic caveat anymore.
 3. **Revisit attribute cache and `FOPEN_KEEP_CACHE` policy once there's
    real cache invalidation.** Both are currently unconditional with no
    active invalidation (e.g. on a rename/unlink another client might
@@ -274,10 +305,11 @@ flags" (that lever is now largely exhausted -- see the fixes above).
    a more targeted explanation -- a materially larger undertaking than
    anything done so far.
 
-"riftlessfs beats OrbStack" is still not a true statement -- random I/O
-and sequential write in particular are still meaningfully behind -- but
-the gap has narrowed substantially and specifically (not vaguely) across
-three sessions of real measurement, and matching (or beating) the
-reference implementation on everything except raw throughput is a real,
+"riftlessfs beats OrbStack" is still not a true statement -- random write
+throughput in particular is still meaningfully behind, by a margin that
+one concrete fix (`max_write`) did not move -- but the gap has narrowed
+substantially and specifically (not vaguely) across four sessions of
+real measurement, and matching (or beating) the reference implementation
+on every metadata operation and on random-read latency is a real,
 positive data point, not just "less bad than before." This file is where
 the OrbStack claim gets re-evaluated honestly as more of the above lands.

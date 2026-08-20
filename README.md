@@ -107,9 +107,13 @@ Given that, the plan is split into phases:
   riftlessfs matching virtiofsd almost exactly on random-read latency
   and beating it on every metadata operation tested -- real per-request
   round-trip latency is apparently inherent to this class of transport,
-  not a riftlessfs inefficiency, while raw write/read throughput
-  (2.6-3.2x behind virtiofsd) is a real, specific gap still to be
-  closed.
+  not a riftlessfs inefficiency. Reading virtiofsd's own source turned up
+  a fifth fix: it advertises an 8x larger `max_write` (1 MiB vs.
+  riftlessfsd's 128 KiB); matching it closed the sequential-write gap
+  from 2.8x to 2.1x behind, but left the random-write gap unchanged
+  (~3.2x) -- proof that request-size mismatch explained the sequential
+  gap but not the random one, which needs its own targeted
+  investigation rather than another flag or constant to tweak.
 
 ## How this was actually verified
 

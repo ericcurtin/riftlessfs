@@ -79,11 +79,11 @@ if [ -z "$FIRMWARE_CODE" ] || [ -z "$FIRMWARE_VARS_SRC" ]; then
 fi
 log "using firmware code=$FIRMWARE_CODE vars=$FIRMWARE_VARS_SRC"
 
-if [ ! -e /dev/kvm ]; then
-  log "warning: /dev/kvm not available, falling back to TCG (much slower)"
-  ACCEL="-accel tcg"
-else
+if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
   ACCEL="$ACCEL_KVM"
+else
+  log "warning: /dev/kvm not usable (missing, or not readable/writable by this user), falling back to TCG (much slower)"
+  ACCEL="-accel tcg"
 fi
 
 RIFTLESSFSD_BIN="${RIFTLESSFSD_BIN:-$(dirname "$0")/../target/release/riftlessfsd}"

@@ -95,6 +95,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 qemu-system-arm ovmf qemu-efi-aarch64 genisoimage
+      - name: Allow KVM access
+        # GitHub-hosted Linux runners may expose /dev/kvm but not grant
+        # the runner user access to it by default; without this, the test
+        # script falls back to (much slower) TCG software emulation.
+        run: |
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+          else
+            echo "/dev/kvm not present on this runner; will use TCG"
+          fi
       - name: Cache Fedora cloud image
         uses: actions/cache@v4
         with:

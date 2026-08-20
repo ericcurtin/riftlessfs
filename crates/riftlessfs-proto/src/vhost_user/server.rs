@@ -87,6 +87,24 @@ impl Server {
 
     /// Run the blocking control-message + virtqueue-processing loop until
     /// the connection is closed.
+    ///
+    /// A bounded busy-poll before blocking in `poll()` was tried and
+    /// measured here (not just considered): profiling (see
+    /// [`Self::process_vring`]'s trace logging) showed our own
+    /// per-request processing takes ~2us, so essentially all of a
+    /// request's ~120us round-trip latency (measured against a real
+    /// guest -- see BENCHMARKS.md) is spent waiting to be woken up, not
+    /// doing work, suggesting a busy-poll (avoiding this process's own
+    /// scheduler wake-up cost) might help. Measured result: no
+    /// significant change to random-I/O throughput/latency. That's a
+    /// useful negative result, not a wasted one -- it means the
+    /// remaining latency is dominated by something further down the
+    /// chain this process doesn't control (QEMU's own event loop
+    /// wake-up, the guest kernel's own task scheduling, HVF/KVM
+    /// interrupt-injection cost, ...), not by riftlessfsd's own wait
+    /// here. Documented in BENCHMARKS.md rather than left as a silent
+    /// revert; not worth the CPU cost of keeping given no measured
+    /// benefit in the one environment this could be tested in so far.
     pub fn run(mut self) -> ProtoResult<()> {
         loop {
             let mut fds = vec![libc::pollfd {
@@ -153,6 +171,13 @@ impl Server {
                 chain.readable,
                 chain.writable
             );
+            // Cheap when RUST_LOG doesn't enable trace (the format! args
+            // aren't even evaluated), but lets us answer "how much of the
+            // per-request latency is our own processing, vs. everything
+            // outside our control (VM exit/entry, scheduler wake-up,
+            // etc.)?" with real numbers instead of guessing -- see
+            // BENCHMARKS.md's random-I/O discussion.
+            let t0 = std::time::Instant::now();
             let request = vq.gather_readable(mem, &chain)?;
             let reply = self.session.handle(&request);
             let written = match reply {
@@ -160,6 +185,7 @@ impl Server {
                 Reply::None => 0,
             };
             vq.push_used(mem, head, written)?;
+            log::trace!("vring {idx}: request processed in {:?}", t0.elapsed());
             processed += 1;
         }
 

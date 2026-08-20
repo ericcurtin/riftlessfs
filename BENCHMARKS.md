@@ -129,34 +129,71 @@ for readahead to prefetch, and no amount of pipelining helps when the
 ## What's still behind, and why
 
 - **Random read/write (37x / ~1.4x behind) and sequential write (~5x
-  behind).** These aren't caching-flag problems -- they're bounded by
-  the actual per-request round-trip latency of one synchronous
-  request at a time (which is inherent to `iodepth=1` workloads,
-  regardless of flags), or by writeback batching granularity. Closing
-  these further needs either genuinely faster per-request processing
-  (see "Next steps" #1) or isn't fully closable without OrbStack-style
-  lower-level optimizations (shared-memory/DAX-style zero-copy, which
-  riftlessfs doesn't attempt yet).
+  behind).** Not caching-flag problems -- bounded by the actual
+  per-request round-trip latency of one synchronous request at a time
+  (inherent to `iodepth=1` workloads), or by writeback batching
+  granularity. See "Where the per-request latency actually goes" below
+  for what was found (and ruled out) trying to close this further.
 - **Sequential read (3.6x behind).** Improved substantially (v4); the
-  remainder is plausibly the same one-request-at-a-time processing loop
-  and/or missing DAX-style optimizations, same as sequential write.
+  remainder is plausibly the same latency floor as sequential write,
+  and/or missing DAX-style optimizations.
 - **Metadata operations show noise, not a clear trend, across v2/v3/v4**
   -- consistent with none of these changes targeting metadata-only
   operations on freshly created, never-read/written files. Treat these
   deltas as measurement noise (see "Methodology") rather than a real
   effect until a more rigorous run says otherwise.
 
+## Where the per-request latency actually goes (and a negative result)
+
+The earlier hypothesis here was that `Server::process_vring`/`Server::run`
+processing one request at a time, without pipelining, was the likely
+remaining lever for random I/O. Rather than assume that and rewrite the
+loop, `process_vring` got real instrumentation
+(`log::trace!("... request processed in {:?}", elapsed)` around the
+gather/dispatch/scatter/push-used sequence, `RUST_LOG=trace`-gated so it
+costs nothing normally), and a small number of real requests were traced
+against the live guest.
+
+Result: riftlessfsd's own processing of a request -- memory reads,
+the actual `pread`/`pwrite` syscall, encoding the reply -- takes
+**~2 microseconds** (occasionally up to tens of microseconds for less
+common opcodes). Random read IOPS (~7.5-8k) imply a **~120-130
+microsecond** round-trip per request. That means well over 95% of the
+latency is spent *outside* riftlessfsd's own code entirely.
+
+Based on that, the next hypothesis was that blocking in `poll()` and
+paying the OS scheduler's wake-up cost on *this process's* side was a
+meaningful chunk of that gap, so a bounded busy-poll (repeated
+non-blocking `poll()` calls for up to 200us before falling back to a
+normal blocking wait -- the same trade-off DPDK-style poll-mode drivers
+make) was implemented and measured, not just proposed. **Measured
+result: no significant change** to random read/write throughput. That's
+a genuine negative result, not a wasted effort: it means the remaining
+latency is dominated by something further down the chain that
+riftlessfsd doesn't control on its own -- QEMU's own event-loop wake-up,
+the guest kernel's task scheduling for the process that issued the I/O,
+HVF/KVM interrupt-injection cost -- not by how riftlessfsd itself waits
+for work. The busy-poll change was reverted rather than kept for a
+CPU cost with no demonstrated benefit (see the `Server::run` doc comment
+in the source for the fuller account).
+
+This significantly changes the "next steps" priority below: rewriting
+riftlessfsd's own request-processing loop for concurrency is *not*
+expected to move random-I/O numbers much on its own, since riftlessfsd's
+own share of the latency is already ~2%. Closing this gap further likely
+needs either a different transport-level mechanism (shared-memory/DAX,
+which is a much larger undertaking) or work outside this project (the
+VMM/guest side of the round trip).
+
 ## Next steps (in priority order)
 
-1. **Pipeline/concurrent request processing.** The current
-   `Server::process_vring` loop handles one descriptor chain fully
-   (dispatch, syscall, encode, push to used ring) before looking at the
-   next, and `Server::run`'s poll loop only looks at one vring's kick fd
-   readiness at a time per iteration. This is the most likely remaining
-   lever for random I/O and further sequential throughput -- profiling
-   where the ~120us/request latency implied by the random-read IOPS
-   numbers actually goes (syscall overhead? VM exit cost? our own
-   processing?) would help target this precisely instead of guessing.
+1. **Compare against stock `virtiofsd` on Linux**, not just OrbStack on
+   macOS. This is now the highest-value next step: it would show whether
+   the ~120us round trip is inherent to this whole class of transport
+   (vhost-user + a VMM + a guest kernel) or whether OrbStack/virtiofsd
+   have found ways around it that riftlessfs hasn't yet -- important to
+   know before investing in a bigger architectural change chasing a gap
+   that might not be closable at this layer.
 2. **Add repeatability to this benchmark suite**: multiple runs with
    variance reported, before drawing further conclusions from small
    deltas (see the metadata-noise and v3->v4-write-regression notes
@@ -166,9 +203,10 @@ for readahead to prefetch, and no amount of pipelining helps when the
    active invalidation (e.g. on a rename/unlink another client might
    have cached, or a host-side write outside riftlessfsd), which matters
    more with multiple guests or host-side writers involved.
-4. **Compare against stock `virtiofsd` on Linux**, not just OrbStack on
-   macOS, to separate "riftlessfs-specific inefficiency" from "inherent
-   cost of this class of transport."
+4. **Investigate DAX/shared-memory-style reads**, if (1) shows OrbStack
+   is doing something at that level -- a materially larger undertaking
+   than anything done so far, so worth confirming it's actually the
+   right lever before starting.
 
 "riftlessfs beats OrbStack" is still not a true statement -- random I/O
 and sequential write in particular are still meaningfully behind -- but

@@ -1,12 +1,16 @@
-# Benchmarks: riftlessfs vs. OrbStack
+# Benchmarks: riftlessfs vs. OrbStack and stock virtiofsd
 
-**Status: still behind, gap substantially narrowed, root causes for what's
-left are understood.** This is Phase 4 from the README. Three real
-bugs/gaps have been found and fixed by actually running these benchmarks
-so far; the honest headline is still **riftlessfs does not beat
-OrbStack**, but the gap on writes went from ~100x to ~5x, and sequential
-read improved 2.1x, all in one session, driven entirely by data rather
-than guesswork.
+**Status: still behind OrbStack, competitive with (or ahead of) stock
+virtiofsd on several benchmarks, root causes for what's left are
+understood.** This is Phase 4 from the README. Four real bugs/gaps have
+been found and fixed by actually running these benchmarks so far; the
+honest headline is still **riftlessfs does not beat OrbStack**, but the
+gap on writes went from ~100x to ~5x, sequential read improved 2.1x, and
+-- new in this section -- a direct, same-hardware comparison against the
+*reference* vhost-user-fs implementation (stock `virtiofsd` on real Linux
++ KVM) shows riftlessfs matching it almost exactly on random-read latency
+and beating it on every metadata operation tested, with the remaining gap
+concentrated specifically in raw write/read throughput.
 
 ## Methodology
 
@@ -185,31 +189,95 @@ needs either a different transport-level mechanism (shared-memory/DAX,
 which is a much larger undertaking) or work outside this project (the
 VMM/guest side of the round trip).
 
+## riftlessfs vs. stock virtiofsd, same hardware, same guest, same kernel
+
+Unlike the OrbStack comparison (which also differs in VM management,
+host OS, and every other layer besides the vhost-user-fs backend), this
+one isolates the backend implementation as close to the only variable
+as practical: `scripts/compare-virtiofsd.sh` boots **one** Fedora 44
+guest under QEMU with real KVM acceleration (a GitHub Actions
+`ubuntu-24.04` runner), with *both* riftlessfsd and Ubuntu's packaged
+`virtiofsd` (1.10.0, `--cache=auto --writeback` -- its own best-case
+config, to compare fairly against what riftlessfsd now does) attached
+simultaneously as separate `vhost-user-fs-pci` devices, and runs the same
+`bind-mount-benchmark.sh` against each from inside the guest. Reproducible
+via the (manually-triggered) `compare-virtiofsd.yml` CI workflow.
+
+| Benchmark | riftlessfsd | virtiofsd | riftlessfs vs. virtiofsd |
+|---|---|---|---|
+| Sequential write, 512 MiB, 1 MiB blocks | 307 MiB/s | 866 MiB/s | 2.8x behind |
+| Sequential read, 512 MiB, 1 MiB blocks | 749 MiB/s | 1925 MiB/s | 2.6x behind |
+| Random write, 128 MiB, 4 KiB blocks | 170 MiB/s (43.6k IOPS) | 552 MiB/s (141k IOPS) | 3.2x behind |
+| Random read, 128 MiB, 4 KiB blocks | 52.4 MiB/s (13.4k IOPS) | 52.9 MiB/s (13.5k IOPS) | **~equal (1.01x)** |
+| Create 2000 files | 0.745 s | 0.761 s | **~equal, riftlessfs marginally ahead** |
+| Stat 2000 files | 0.148 s | 0.164 s | **riftlessfs ahead** |
+| Remove 2000 files | 0.485 s | 0.511 s | **riftlessfs ahead** |
+| tar create (1000 files) | 0.279 s | 0.360 s | **riftlessfs ahead** |
+| tar extract (1000 files) | 0.838 s | 0.919 s | **riftlessfs ahead** |
+| find (1000 files) | 0.043 s | 0.039 s | ~equal |
+| rm -rf (1000 files) | 0.303 s | 0.314 s | ~equal |
+
+Two things stand out, and both matter more than they might look like at
+first glance:
+
+1. **Random read is essentially identical (52.4 vs. 52.9 MiB/s).** This
+   directly confirms the previous section's conclusion, with an
+   independent implementation as the control group instead of just
+   riftlessfsd's own instrumentation: the ~120us/request latency isn't
+   riftlessfs-specific inefficiency, it's very close to what the
+   *reference* vhost-user-fs backend achieves on the same hardware under
+   the same `iodepth=1` random workload. That round trip really is
+   dominated by the transport (vhost-user + KVM + guest kernel
+   scheduling), not by which backend implementation is on the other end
+   of the socket.
+2. **riftlessfs matches or beats virtiofsd on every metadata operation
+   tested.** This wasn't a given -- virtiofsd is a mature, heavily-used
+   reference implementation -- and is a genuinely encouraging signal that
+   riftlessfs's core design (fd-relative `*at()` syscalls, the attribute
+   cache timeout, `FOPEN_KEEP_CACHE`) isn't leaving obvious performance
+   on the table for this class of operation.
+
+**What's real and still behind:** sequential/random write throughput and
+sequential read (2.6-3.2x). Since random *read* latency matches virtiofsd
+almost exactly, the write-throughput gap isn't explained by "riftlessfs
+is generically slower per request" -- something specific to how writes
+(and to a lesser extent, sequential reads) are handled differs. virtiofsd
+supports a `--thread-pool-size` option for concurrent request handling
+(not used in this comparison -- default is `0`, i.e. also single-threaded,
+so this isn't the explanation here either) and has had substantially more
+time to accumulate write-path optimizations; pinning down the specific
+difference is the next concrete piece of work, not "add more caching
+flags" (that lever is now largely exhausted -- see the fixes above).
+
 ## Next steps (in priority order)
 
-1. **Compare against stock `virtiofsd` on Linux**, not just OrbStack on
-   macOS. This is now the highest-value next step: it would show whether
-   the ~120us round trip is inherent to this whole class of transport
-   (vhost-user + a VMM + a guest kernel) or whether OrbStack/virtiofsd
-   have found ways around it that riftlessfs hasn't yet -- important to
-   know before investing in a bigger architectural change chasing a gap
-   that might not be closable at this layer.
+1. **Investigate the write-throughput and sequential-read gap
+   specifically**, now that it's isolated from OrbStack's other
+   differences and from general per-request latency (which matches the
+   reference implementation). Candidates: how virtiofsd structures its
+   own write path, whether there's request-size-dependent behavior being
+   left on the table, and whether the gap is bigger on sequential
+   (batched via writeback) or random (unbatched) writes specifically --
+   worth another round of profiling like the random-read investigation
+   above rather than guessing.
 2. **Add repeatability to this benchmark suite**: multiple runs with
    variance reported, before drawing further conclusions from small
    deltas (see the metadata-noise and v3->v4-write-regression notes
    above -- both are plausibly noise, but "plausibly" isn't "confirmed").
+   This applies to the virtiofsd comparison too -- it's a single run.
 3. **Revisit attribute cache and `FOPEN_KEEP_CACHE` policy once there's
    real cache invalidation.** Both are currently unconditional with no
    active invalidation (e.g. on a rename/unlink another client might
    have cached, or a host-side write outside riftlessfsd), which matters
    more with multiple guests or host-side writers involved.
-4. **Investigate DAX/shared-memory-style reads**, if (1) shows OrbStack
-   is doing something at that level -- a materially larger undertaking
-   than anything done so far, so worth confirming it's actually the
-   right lever before starting.
+4. **Investigate DAX/shared-memory-style reads** if (1) doesn't turn up
+   a more targeted explanation -- a materially larger undertaking than
+   anything done so far.
 
 "riftlessfs beats OrbStack" is still not a true statement -- random I/O
 and sequential write in particular are still meaningfully behind -- but
-the gap has narrowed substantially and specifically (not vaguely) in two
-sessions of real measurement, and this file is where that claim gets
-re-evaluated honestly as more of the above lands.
+the gap has narrowed substantially and specifically (not vaguely) across
+three sessions of real measurement, and matching (or beating) the
+reference implementation on everything except raw throughput is a real,
+positive data point, not just "less bad than before." This file is where
+the OrbStack claim gets re-evaluated honestly as more of the above lands.

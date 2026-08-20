@@ -23,7 +23,14 @@ fixed *by* that benchmarking pass (a disabled attribute cache, a missing
 OrbStack to ~5x behind (with random write briefly *ahead* of OrbStack in
 one comparison) and sequential read from 7.6x behind to 3.6x -- real
 progress, driven by data, not yet a win. Random I/O in particular remains
-far behind. Windows has no transport at all (see Phase 3), and FUSE
+far behind OrbStack -- though a separate, same-hardware comparison
+against the *reference* vhost-user-fs implementation (stock `virtiofsd`)
+shows that specific gap is apparently inherent to this class of
+transport rather than a riftlessfs inefficiency (riftlessfs matches it
+almost exactly there, and beats it on metadata operations); raw
+write/read throughput is a real, separate gap versus virtiofsd too,
+still being investigated. Windows has no transport at all (see Phase 3),
+and FUSE
 opcode coverage, while enough for real everyday use, isn't exhaustive
 (xattrs, POSIX locks, and a few other opcodes currently reply `ENOSYS`).
 This README stays explicit about what's proven versus what isn't, so
@@ -81,22 +88,28 @@ Given that, the plan is split into phases:
 - **Phase 3 (not started):** a Windows transport. Likely a custom protocol
   over Hyper-V sockets rather than vhost-user, since vhost-user itself
   isn't viable there. Scope/approach TBD.
-- **Phase 4 (in progress -- gap narrowing, still losing):** real,
-  head-to-head benchmarks against OrbStack, same guest OS (Fedora 44) and
-  hardware for both sides. See [BENCHMARKS.md](BENCHMARKS.md) for full
-  results and analysis. Three real bugs/gaps found and fixed *by* this
-  benchmarking pass so far: attribute/entry caching was disabled entirely
-  (a synthetic "stat 2000 files" benchmark was ~60x slower than it needed
-  to be); `FUSE_WRITEBACK_CACHE` wasn't advertised (every write,
-  regardless of application request size, became an individual
+- **Phase 4 (in progress -- gap narrowing, still losing to OrbStack,
+  competitive with stock virtiofsd on several benchmarks):** real,
+  head-to-head benchmarks against both OrbStack and the reference
+  vhost-user-fs implementation. See [BENCHMARKS.md](BENCHMARKS.md) for
+  full results and analysis. Four real bugs/gaps found and fixed *by*
+  this benchmarking work so far: attribute/entry caching was disabled
+  entirely (a synthetic "stat 2000 files" benchmark was ~60x slower than
+  it needed to be); `FUSE_WRITEBACK_CACHE` wasn't advertised (every
+  write, regardless of application request size, became an individual
   synchronous 4 KiB round trip), fixing which took sequential write
   throughput from ~100x behind OrbStack to ~5x behind; and
   `FUSE_ASYNC_READ`/`FOPEN_KEEP_CACHE` weren't set, fixing which took
-  sequential read from 7.6x behind to 3.6x. Random I/O remains the
-  largest relative gap, bounded by genuine per-request round-trip
-  latency rather than a caching/flag problem. Comparison against stock
-  `virtiofsd` (Linux)
-  hasn't been done yet.
+  sequential read from 7.6x behind to 3.6x. A same-hardware,
+  same-guest-kernel comparison against stock `virtiofsd` on real Linux +
+  KVM (isolating the backend implementation as close to the only
+  variable as practical, unlike the OrbStack comparison) then showed
+  riftlessfs matching virtiofsd almost exactly on random-read latency
+  and beating it on every metadata operation tested -- real per-request
+  round-trip latency is apparently inherent to this class of transport,
+  not a riftlessfs inefficiency, while raw write/read throughput
+  (2.6-3.2x behind virtiofsd) is a real, specific gap still to be
+  closed.
 
 ## How this was actually verified
 

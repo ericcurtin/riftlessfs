@@ -13,13 +13,19 @@ correctly (verified with `sha256sum` matching on both sides). This is a
 real milestone, not a simulation -- see "How this was actually verified"
 below for exactly what was tested and how.
 
-What's *not* done yet: there are no performance numbers, let alone
-comparisons to OrbStack (see Phase 4 below); Windows has no transport at
-all (see Phase 3); and the FUSE opcode coverage, while enough for real
-everyday use, isn't exhaustive (xattrs, POSIX locks, and a few other
-opcodes currently reply `ENOSYS`). This README stays explicit about
-what's proven versus what isn't, so nobody mistakes "it mounts" for "this
-beats OrbStack" -- that comparison hasn't been made yet.
+What's *not* true yet: **riftlessfs does not beat OrbStack.** Real,
+head-to-head benchmarks now exist (see [BENCHMARKS.md](BENCHMARKS.md),
+Phase 4) -- comparing riftlessfs against OrbStack, same guest OS, same
+hardware, same workloads -- and riftlessfs currently loses badly on write
+throughput (~100x, root-caused to a specific missing FUSE feature) and
+was significantly behind on metadata operations until a real bug (a
+`0`-second attribute cache) was found and fixed via that same
+benchmarking pass. Windows has no transport at all (see Phase 3), and
+FUSE opcode coverage, while enough for real everyday use, isn't
+exhaustive (xattrs, POSIX locks, and a few other opcodes currently reply
+`ENOSYS`). This README stays explicit about what's proven versus what
+isn't, so nobody mistakes "it mounts, and is correct" for "this beats
+OrbStack."
 
 ## Why this is hard, and what "beating OrbStack" actually requires
 
@@ -71,13 +77,18 @@ Given that, the plan is split into phases:
 - **Phase 3 (not started):** a Windows transport. Likely a custom protocol
   over Hyper-V sockets rather than vhost-user, since vhost-user itself
   isn't viable there. Scope/approach TBD.
-- **Phase 4 (not started):** real, reproducible benchmarks against
-  OrbStack (macOS-only, so this comparison only makes sense on macOS CI/dev
-  hardware) and against stock `virtiofsd` (Linux), using representative
-  workloads (`fio` random/sequential I/O, `git status`/`clone`, `tar`,
-  a real compile) -- not synthetic microbenchmarks. Nothing in this
-  category exists yet: everything verified so far is *correctness*, not
-  *performance*.
+- **Phase 4 (first pass done -- riftlessfs currently loses):** real,
+  head-to-head benchmarks against OrbStack, same guest OS (Fedora 44) and
+  hardware for both sides. See [BENCHMARKS.md](BENCHMARKS.md) for the full
+  results and analysis. Headline: riftlessfs is ~100x slower on write
+  throughput (root cause: no `FUSE_WRITEBACK_CACHE`, so every write
+  becomes a synchronous 4 KiB round trip regardless of request size --
+  not yet fixed, this session's benchmarking pass explicitly stopped
+  short of it as too risky to do hastily) and was significantly behind on
+  metadata operations until a real bug (attribute/entry caching disabled
+  entirely) was found *by this same benchmarking pass* and fixed,
+  cutting a synthetic "stat 2000 files" benchmark by ~60x. Comparison
+  against stock `virtiofsd` (Linux) hasn't been done yet.
 
 ## How this was actually verified
 
@@ -136,15 +147,18 @@ runners using each distro's packaged QEMU. It passes reliably (~90s) on
 the x86_64 runner, which has usable `/dev/kvm`. The aarch64 runner
 (`ubuntu-24.04-arm`, as of this writing) exposes no `/dev/kvm` at all,
 forcing pure TCG software emulation, under which a full Fedora boot +
-cloud-init + file I/O routinely exceeds even a 15-minute wait; that job
-is allowed to fail without blocking CI (it's a runner limitation, not a
-code issue -- the identical scenario is what was verified manually on
-real Apple Silicon hardware above).
+cloud-init + file I/O routinely exceeds even a 15-minute wait; CI detects
+that up front and **skips** the test there rather than running it and
+timing out (it's a runner limitation, not a code issue -- the identical
+scenario is what was verified manually on real Apple Silicon hardware
+above).
 
 Anyone continuing this work should still read the module docs in
 `riftlessfs-proto` before assuming everything left is easy: FUSE opcode
-coverage is real but not exhaustive, there's no performance tuning at
-all yet, and Phase 4 (actual OrbStack comparisons) hasn't started.
+coverage is real but not exhaustive, and -- see
+[BENCHMARKS.md](BENCHMARKS.md) -- performance is currently well behind
+OrbStack, with the biggest known gap (no `FUSE_WRITEBACK_CACHE`) not yet
+fixed.
 
 ## What's implemented today
 
@@ -201,12 +215,13 @@ cargo test --workspace
 cargo bench -p riftlessfs-bench
 ```
 
-This currently measures the engine's *own* overhead in-process (inode
-table bookkeeping, locking, etc.) against raw `std::fs`/libc calls on the
-same directory -- useful for catching regressions in the engine itself,
-but it says nothing yet about end-to-end bind-mount performance across a
-VM boundary, since there is no transport yet. Phase 4 above is where
-OrbStack comparisons belong.
+This measures the engine's *own* overhead in-process (inode table
+bookkeeping, locking, etc.) against raw `std::fs`/libc calls on the same
+directory -- useful for catching regressions in the engine itself, but
+it's not the same thing as end-to-end bind-mount performance across a VM
+boundary. For that, see [BENCHMARKS.md](BENCHMARKS.md) and
+`scripts/bind-mount-benchmark.sh`, which is where the real OrbStack
+comparisons live.
 
 ## Repository layout
 

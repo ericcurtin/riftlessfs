@@ -210,12 +210,24 @@ pub const ATTR_LEN: usize = 88;
 pub const ENTRY_OUT_LEN: usize = 128;
 pub const ATTR_OUT_LEN: usize = 104;
 
-/// A conservative, fixed cache timeout for attribute/entry validity: since
-/// we're a thin passthrough with no invalidation notifications implemented
-/// yet, we tell the kernel not to cache at all (matches how many simple
-/// passthrough filesystems start out; revisit once cache invalidation
-/// exists).
-const CACHE_TIMEOUT_SECS: u64 = 0;
+/// A fixed cache timeout for attribute/entry validity, applied uniformly
+/// (no distinction between recently-modified-by-us vs. untouched
+/// entries).
+///
+/// A real measurement motivated picking a nonzero value here: with this
+/// at 0, a synthetic "stat 2000 files" benchmark took ~2s against
+/// riftlessfsd vs. ~3ms against OrbStack, because every single `stat()`
+/// call became a synchronous round trip through the whole vhost-user/FUSE
+/// pipeline instead of being served from the guest kernel's own cache.
+/// One second is a common, conservative default (used by e.g. many
+/// FUSE-based network filesystems) -- it means a change made directly on
+/// the host (bypassing riftlessfsd) can take up to this long to become
+/// visible in the guest, which is an ordinary, expected FUSE caching
+/// trade-off, not a correctness bug. There's no active cache
+/// invalidation yet (e.g. on rename/unlink of an entry another client
+/// might have cached), which matters more once multiple guests or
+/// host-side writers are involved -- tracked as follow-up work.
+const CACHE_TIMEOUT_SECS: u64 = 1;
 
 /// `struct fuse_entry_out`: nodeid, generation, entry/attr cache timeouts,
 /// then a `fuse_attr`.

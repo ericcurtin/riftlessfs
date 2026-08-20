@@ -276,9 +276,17 @@ impl InitIn {
     }
 }
 
-/// Maximum single read/write size we advertise (and enforce) -- 128 KiB,
-/// a conservative, widely-used value.
-pub const MAX_WRITE: u32 = 128 * 1024;
+/// Maximum single read/write size we advertise (and enforce). Matches
+/// upstream `virtiofsd`'s `MAX_BUFFER_SIZE` (1 MiB) rather than a smaller,
+/// seemingly-conservative value: this constant directly bounds how large
+/// a single `WRITE`/`READ` request the kernel will ever send can be, and
+/// since per-request round-trip latency is largely fixed (see
+/// BENCHMARKS.md's latency profiling), a *smaller* max_write means *more*
+/// round trips to move the same amount of data -- i.e. strictly worse
+/// throughput, not more "conservative" in any useful sense. This was the
+/// single biggest concrete difference found comparing riftlessfsd against
+/// virtiofsd's `init()` reply (see BENCHMARKS.md's virtiofsd comparison).
+pub const MAX_WRITE: u32 = 1 << 20;
 
 /// Without this, the guest kernel doesn't coalesce dirty pages before
 /// sending `WRITE` requests: every buffered `write()` syscall, regardless
@@ -319,8 +327,15 @@ pub fn init_out(max_readahead: u32) -> Vec<u8> {
     w.u32(INIT_OUT_MINOR);
     w.u32(max_readahead);
     w.u32(FUSE_WRITEBACK_CACHE | FUSE_ASYNC_READ);
-    w.u16(0); // max_background
-    w.u16(0); // congestion_threshold
+    // Matching virtiofsd: max out how many background (writeback)
+    // requests the kernel will queue before throttling the writer,
+    // rather than the previous 0 (which, per the FUSE ABI, doesn't mean
+    // "no background requests allowed" but does mean the kernel's
+    // default is used inconsistently across scenarios -- being explicit
+    // and generous here removes one more variable from the
+    // writeback-cache-vs-virtiofsd comparison).
+    w.u16(u16::MAX); // max_background
+    w.u16((u16::MAX / 4) * 3); // congestion_threshold
     w.u32(MAX_WRITE);
     w.u32(1); // time_gran: 1ns (we report real nanosecond timestamps)
     w.u16(0); // max_pages (feature not advertised, kernel ignores)

@@ -25,9 +25,14 @@ const VIRTQ_DESC_F_WRITE: u16 = 2;
 const VIRTQ_DESC_F_INDIRECT: u16 = 4;
 
 /// A maximum chain length we'll walk before giving up and treating it as
-/// malformed/malicious -- real FUSE-over-virtio requests use a handful of
-/// descriptors at most.
-const MAX_CHAIN_LEN: usize = 128;
+/// malformed/malicious. Needs to comfortably fit the worst case for our
+/// largest advertised request size (`fuse::wire::MAX_WRITE`, 1 MiB): if
+/// the guest's memory backing a single large `WRITE`/`READ` buffer isn't
+/// physically contiguous, it can take one descriptor per 4 KiB page (256
+/// for 1 MiB), plus the FUSE header/response descriptors -- 512 leaves
+/// comfortable headroom over that worst case while still being far below
+/// a queue's total descriptor count (1024 in our own testing).
+const MAX_CHAIN_LEN: usize = 512;
 
 #[derive(Debug, thiserror::Error)]
 pub enum VirtqueueError {

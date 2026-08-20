@@ -86,8 +86,18 @@ impl OutHeader {
         w.into_vec()
     }
 
-    pub fn error_for(unique: u64, errno: i32) -> Vec<u8> {
-        Self::reply(unique, -errno, &[])
+    /// Build an error reply for `unique` from a **host** errno (e.g. from
+    /// [`riftlessfs_core::FsError::errno`] or a `libc::E*` constant).
+    /// Translates to the Linux errno the wire protocol requires --
+    /// callers should never write a raw host errno onto the wire
+    /// themselves; see [`crate::fuse::linux_errno`] for why that's
+    /// dangerous on non-Linux hosts.
+    pub fn error_for(unique: u64, host_errno: i32) -> Vec<u8> {
+        Self::reply(
+            unique,
+            -crate::fuse::linux_errno::to_linux_errno(host_errno),
+            &[],
+        )
     }
 }
 

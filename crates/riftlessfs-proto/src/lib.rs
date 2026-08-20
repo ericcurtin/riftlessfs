@@ -1,12 +1,17 @@
 //! Portable vhost-user / virtio-fs wire protocol implementation.
 //!
-//! **Status: partial.** The message framing layer (header + payload
-//! (de)serialization, `SCM_RIGHTS`-aware socket transport) is implemented
-//! and tested. What's *not* implemented yet is the part that makes this
-//! actually useful: mapping guest memory from `SET_MEM_TABLE`, parsing
-//! virtqueues out of it, decoding FUSE-over-virtio requests, and
-//! dispatching them to [`riftlessfs_core::PassthroughFs`]. There is no
-//! mountable filesystem yet.
+//! **Status: working, verified against a real guest kernel.** This crate
+//! implements the full path from an incoming vhost-user connection to
+//! serving real FUSE-over-virtio requests: message framing, `SCM_RIGHTS`
+//! socket transport, guest memory mapping, split-virtqueue parsing, FUSE
+//! wire structs, request dispatch into [`riftlessfs_core::PassthroughFs`],
+//! and the event loop tying it together ([`vhost_user::server::Server`]).
+//! It has been verified end-to-end against a real, unmodified Fedora
+//! Linux 44 guest under QEMU -- see the workspace README's "How this was
+//! actually verified" section for exactly what was tested. FUSE opcode
+//! coverage is real but not exhaustive (notably: no xattrs, no POSIX
+//! locks yet -- see `fuse::dispatch`), and there's been no performance
+//! tuning at all.
 //!
 //! The obvious way to implement this (the `vhost`, `vhost-user-backend`,
 //! `vm-memory` crates from the rust-vmm project -- what upstream
@@ -17,7 +22,7 @@
 //!
 //! - `std::os::unix::net::UnixStream` + the [`sendfd`] crate for
 //!   `SCM_RIGHTS` fd passing (works identically on Linux and macOS).
-//! - `libc::mmap` for mapping guest memory (not yet wired up).
+//! - `libc::mmap` for mapping guest memory ([`vhost_user::memory`]).
 //! - A hand-written [`doorbell::Doorbell`] for the cases where *we* need
 //!   to create an eventfd-like signal (internal coordination, and
 //!   simulating a front-end in tests) -- turns out the main kick/call

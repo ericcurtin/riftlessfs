@@ -482,7 +482,10 @@ mod tests {
         match session.handle(&req) {
             Reply::Bytes(b) => {
                 let err = i32::from_le_bytes(b[4..8].try_into().unwrap());
-                assert_eq!(err, -libc::ENOSYS);
+                // -38, Linux's ENOSYS, on the wire -- *not* this host's
+                // own ENOSYS value (see linux_errno module docs for why
+                // that distinction matters).
+                assert_eq!(err, -38);
             }
             Reply::None => panic!("expected an ENOSYS reply"),
         }

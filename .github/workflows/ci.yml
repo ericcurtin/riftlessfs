@@ -68,3 +68,37 @@ jobs:
         run: |
           cargo bench -p riftlessfs-bench --bench core_ops --no-run
           cargo bench -p riftlessfs-bench --bench core_ops -- --measurement-time 1 --warm-up-time 1 --sample-size 10
+
+  qemu-integration:
+    name: qemu-integration (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    # This boots a real Fedora 44 guest under QEMU and mounts riftlessfsd
+    # as a real vhost-user-fs backend (see the README's "How this was
+    # actually verified" section) -- it's slow, especially without KVM
+    # (GitHub-hosted runners generally don't expose /dev/kvm, so this
+    # mostly runs under software emulation), so it gets a generous timeout
+    # and runs independently of the fast build-and-test matrix above.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install QEMU + UEFI firmware
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-system-arm ovmf qemu-efi-aarch64 genisoimage
+      - name: Cache Fedora cloud image
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/riftlessfs-qemu-test
+          key: fedora-cloud-44-${{ matrix.name }}
+      - name: Run QEMU integration test
+        run: ./scripts/qemu-integration-test.sh

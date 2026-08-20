@@ -29,8 +29,14 @@ use super::virtqueue::Virtqueue;
 const PROTOCOL_FEATURES: u64 = 0;
 
 /// Bit 30 (`VHOST_USER_F_PROTOCOL_FEATURES`) tells the front-end we
-/// understand `GET/SET_PROTOCOL_FEATURES` at all.
-const VIRTIO_FEATURES: u64 = 1 << 30;
+/// understand `GET/SET_PROTOCOL_FEATURES` at all. Bit 32
+/// (`VIRTIO_F_VERSION_1`) is required for "modern" (non-transitional)
+/// virtio devices -- without it, front-ends that only support modern mode
+/// for vhost-user-fs (e.g. QEMU) refuse to attach at all ("Device doesn't
+/// support modern mode, and legacy mode is disabled"), which is how this
+/// omission was originally caught.
+const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+const VIRTIO_FEATURES: u64 = (1 << 30) | VIRTIO_F_VERSION_1;
 
 /// Total vrings: 0 = hiprio, 1 = the (single) request queue. Both are
 /// processed identically by this implementation -- see module docs.
@@ -140,7 +146,13 @@ impl Server {
 
         let mut processed = 0;
         while let Some(head) = vq.pop_avail(mem)? {
+            log::debug!("vring {idx}: popped avail head {head}");
             let chain = vq.read_chain(mem, head)?;
+            log::debug!(
+                "vring {idx}: chain readable={:?} writable={:?}",
+                chain.readable,
+                chain.writable
+            );
             let request = vq.gather_readable(mem, &chain)?;
             let reply = self.session.handle(&request);
             let written = match reply {
@@ -190,6 +202,15 @@ impl Server {
                 if regions.regions.len() != fds.len() {
                     return Err(ProtoError::Truncated);
                 }
+                for r in &regions.regions {
+                    log::debug!(
+                        "SET_MEM_TABLE region: gpa=0x{:x} size=0x{:x} userspace_addr=0x{:x} mmap_offset=0x{:x}",
+                        r.guest_phys_addr,
+                        r.memory_size,
+                        r.userspace_addr,
+                        r.mmap_offset
+                    );
+                }
                 let mem = GuestMemory::map_regions(&regions.regions, &fds)?;
                 fds.clear(); // ownership transferred into GuestMemory's mmaps
                 self.mem = Some(mem);
@@ -203,6 +224,13 @@ impl Server {
             }
             Request::SetVringAddr => {
                 let a = VringAddr::from_bytes(&payload)?;
+                log::debug!(
+                    "SET_VRING_ADDR index={} desc=0x{:x} avail=0x{:x} used=0x{:x}",
+                    a.index,
+                    a.descriptor,
+                    a.avail,
+                    a.used
+                );
                 if let Some(slot) = self.vrings.get_mut(a.index as usize) {
                     slot.maybe_build(&a);
                 }
@@ -304,6 +332,7 @@ fn notify(fd: RawFd) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::memory::AddrSpace;
     use super::*;
     use crate::fuse::bytes::Writer;
     use crate::fuse::wire;
@@ -381,13 +410,22 @@ mod tests {
             .unwrap();
 
         // --- shared memory: one 1 MiB anonymous-file-backed region ---
+        //
+        // Deliberately use *different* values for the guest-physical base
+        // and the "user address" base (unlike a naive test that picks 0
+        // for both): mixing up the two address spaces (see the `memory`
+        // module docs) doesn't fail loudly when they happen to coincide,
+        // which is exactly how this bug first slipped past this test and
+        // was only caught against a real QEMU front-end.
         let mem_file = tempfile::tempfile().unwrap();
         let mem_len: u64 = 1 << 20;
         unsafe { libc::ftruncate(mem_file.as_raw_fd(), mem_len as libc::off_t) };
+        const GPA_BASE: u64 = 0x4000_0000;
+        const USER_BASE: u64 = 0x7f_0000_0000;
         let region = MemoryRegion {
-            guest_phys_addr: 0,
+            guest_phys_addr: GPA_BASE,
             memory_size: mem_len,
-            userspace_addr: 0,
+            userspace_addr: USER_BASE,
             mmap_offset: 0,
         };
         let regions = MemoryRegions {
@@ -406,11 +444,16 @@ mod tests {
         let guest_mem = GuestMemory::map_regions(&[region], &[mem_file.as_raw_fd()]).unwrap();
 
         // --- one virtqueue (index 1: the "request" queue) ---
+        // Ring locations are "user addresses" (offsets from USER_BASE);
+        // request/response buffer locations (like a guest driver would
+        // set them) are guest-physical (offsets from GPA_BASE). Both
+        // happen to cover the same underlying bytes in this single-region
+        // setup, just addressed via different bases.
         const QUEUE_SIZE: u16 = 8;
-        let desc_addr = 0x1000u64;
+        let desc_addr = USER_BASE + 0x1000;
         let avail_addr = desc_addr + QUEUE_SIZE as u64 * 16;
         let used_addr = avail_addr + 4 + QUEUE_SIZE as u64 * 2 + 64;
-        let req_addr = used_addr + 4096;
+        let req_addr = GPA_BASE + 0x2000;
         let resp_addr = req_addr + 256;
 
         fe.send(
@@ -479,30 +522,42 @@ mod tests {
         // --- write an INIT request into "guest memory" and kick ---
         let req = init_request(1);
         guest_mem
-            .get_slice_mut(req_addr, req.len() as u64)
+            .get_slice_mut(AddrSpace::Gpa, req_addr, req.len() as u64)
             .unwrap()
             .copy_from_slice(&req);
 
-        // descriptor 0 (readable: the request), descriptor 1 (writable: the reply)
+        // descriptor 0 (readable: the request), descriptor 1 (writable: the
+        // reply). The descriptor *table* lives at a user address; the
+        // `addr` field *inside* each descriptor is guest-physical.
         let d0 = desc_addr;
         guest_mem
-            .get_slice_mut(d0, 8)
+            .get_slice_mut(AddrSpace::User, d0, 8)
             .unwrap()
             .copy_from_slice(&req_addr.to_le_bytes());
-        guest_mem.write_u32(d0 + 8, req.len() as u32).unwrap();
-        guest_mem.write_u16(d0 + 12, 1 /* NEXT */).unwrap();
-        guest_mem.write_u16(d0 + 14, 1).unwrap();
+        guest_mem
+            .write_u32(AddrSpace::User, d0 + 8, req.len() as u32)
+            .unwrap();
+        guest_mem
+            .write_u16(AddrSpace::User, d0 + 12, 1 /* NEXT */)
+            .unwrap();
+        guest_mem.write_u16(AddrSpace::User, d0 + 14, 1).unwrap();
         let d1 = desc_addr + 16;
         guest_mem
-            .get_slice_mut(d1, 8)
+            .get_slice_mut(AddrSpace::User, d1, 8)
             .unwrap()
             .copy_from_slice(&resp_addr.to_le_bytes());
-        guest_mem.write_u32(d1 + 8, 4096).unwrap();
-        guest_mem.write_u16(d1 + 12, 2 /* WRITE */).unwrap();
-        guest_mem.write_u16(d1 + 14, 0).unwrap();
+        guest_mem.write_u32(AddrSpace::User, d1 + 8, 4096).unwrap();
+        guest_mem
+            .write_u16(AddrSpace::User, d1 + 12, 2 /* WRITE */)
+            .unwrap();
+        guest_mem.write_u16(AddrSpace::User, d1 + 14, 0).unwrap();
 
-        guest_mem.write_u16(avail_addr + 4, 0).unwrap(); // ring[0] = head 0
-        guest_mem.write_u16(avail_addr + 2, 1).unwrap(); // avail.idx = 1
+        guest_mem
+            .write_u16(AddrSpace::User, avail_addr + 4, 0)
+            .unwrap(); // ring[0] = head 0
+        guest_mem
+            .write_u16(AddrSpace::User, avail_addr + 2, 1)
+            .unwrap(); // avail.idx = 1
 
         let one: u64 = 1;
         unsafe {
@@ -523,13 +578,15 @@ mod tests {
         assert_eq!(rc, 1, "server should have notified the call fd within 5s");
         assert_ne!(pfd[0].revents & libc::POLLIN, 0);
 
-        assert_eq!(guest_mem.read_u16(used_addr + 2), Some(1)); // used.idx advanced
-        let used_id = guest_mem.read_u32(used_addr + 4).unwrap();
-        let used_len = guest_mem.read_u32(used_addr + 8).unwrap();
+        assert_eq!(guest_mem.read_u16(AddrSpace::User, used_addr + 2), Some(1)); // used.idx advanced
+        let used_id = guest_mem.read_u32(AddrSpace::User, used_addr + 4).unwrap();
+        let used_len = guest_mem.read_u32(AddrSpace::User, used_addr + 8).unwrap();
         assert_eq!(used_id, 0); // head descriptor index
         assert_eq!(used_len as usize, wire::INIT_OUT_LEN + wire::OUT_HEADER_LEN);
 
-        let reply = guest_mem.get_slice(resp_addr, used_len as u64).unwrap();
+        let reply = guest_mem
+            .get_slice(AddrSpace::Gpa, resp_addr, used_len as u64)
+            .unwrap();
         let err = i32::from_le_bytes(reply[4..8].try_into().unwrap());
         assert_eq!(err, 0);
         let major = u32::from_le_bytes(

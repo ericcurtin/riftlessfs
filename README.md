@@ -4,15 +4,22 @@ A userspace virtio-fs daemon (written in Rust) for sharing a host directory
 into a Linux guest VM, with the goal of beating OrbStack's bind-mount
 performance on macOS, Linux, and Windows hosts.
 
-**Status: early days.** The passthrough filesystem engine is real,
-unit-tested, and benchmarked (see below). The vhost-user wire protocol's
-message framing (headers, payloads, `SCM_RIGHTS` socket transport) is also
-real and tested, but the parts that would make it *useful* -- mapping
-guest memory, parsing virtqueues, decoding FUSE-over-virtio requests, and
-dispatching them into the engine -- aren't implemented yet. There is no
-working end-to-end mount today, and no benchmark results against OrbStack
-yet. This README is deliberately explicit about that so nobody mistakes
-"the engine works" for "this beats OrbStack" -- it doesn't, yet.
+**Status: it mounts.** As of this writing, riftlessfsd has been verified
+end-to-end against a real, unmodified **Fedora Linux 44** guest kernel
+under **QEMU** (aarch64, HVF acceleration) on macOS: `mount -t virtiofs
+myfs /mnt/rfs` succeeds, and file creation, reads, writes, directory
+listing, renames, hardlinks, and an 8 MiB file copy all round-trip
+correctly (verified with `sha256sum` matching on both sides). This is a
+real milestone, not a simulation -- see "How this was actually verified"
+below for exactly what was tested and how.
+
+What's *not* done yet: there are no performance numbers, let alone
+comparisons to OrbStack (see Phase 4 below); Windows has no transport at
+all (see Phase 3); and the FUSE opcode coverage, while enough for real
+everyday use, isn't exhaustive (xattrs, POSIX locks, and a few other
+opcodes currently reply `ENOSYS`). This README stays explicit about
+what's proven versus what isn't, so nobody mistakes "it mounts" for "this
+beats OrbStack" -- that comparison hasn't been made yet.
 
 ## Why this is hard, and what "beating OrbStack" actually requires
 
@@ -53,35 +60,14 @@ Given that, the plan is split into phases:
 - **Phase 1 (done):** a transport-agnostic passthrough filesystem *engine*
   (`riftlessfs-core`) that's correct and fast in isolation, portable to
   Linux and macOS today.
-- **Phase 2 (in progress):** a hand-rolled, portable subset of the
-  vhost-user + virtio-fs (FUSE-over-virtio) wire protocol
-  (`riftlessfs-proto`) that avoids the Linux-only pieces of the rust-vmm
-  stack.
-  - *Done:* message header/payload (de)serialization for the requests
-    needed to negotiate features and set up vrings (`GET/SET_FEATURES`,
-    `GET/SET_PROTOCOL_FEATURES`, `SET_MEM_TABLE`, `SET_VRING_*`,
-    `GET_QUEUE_NUM`); a `SCM_RIGHTS`-aware socket transport on top of
-    `std::os::unix::net::UnixStream` + the [`sendfd`](https://docs.rs/sendfd)
-    crate (confirmed working for both plain messages and fd-passing, on
-    macOS, via real `UnixStream::pair()` round-trip tests); and a portable
-    `Doorbell` type. One correction to the original plan: the "`eventfd`
-    doesn't exist on macOS" gap turned out not to block the main kick/call
-    notification path at all -- those fds are *created by the front-end*
-    and handed to us, so we only ever need generic POSIX
-    read/write/poll on them, regardless of what kind of fd they are.
-    `Doorbell` ended up useful only for internal coordination and for
-    simulating a front-end in tests.
-  - *Not done yet (the bulk of the remaining effort):* actually mapping
-    the memory regions a `SET_MEM_TABLE` request hands us (`mmap`-ing the
-    passed fds and translating guest physical addresses), parsing the
-    split-virtqueue layout (descriptor table / avail ring / used ring) out
-    of that mapped memory, defining the FUSE-over-virtio wire structs
-    (`fuse_in_header`/`fuse_out_header` and per-opcode payloads matching
-    Linux's `fuse.h`), and a dispatch loop wiring decoded requests into
-    `riftlessfs-core::PassthroughFs`. None of this can be meaningfully
-    tested without at least a fake virtqueue in guest-like memory, and
-    real confidence needs an actual VMM (QEMU, or Apple's
-    Virtualization.framework via a custom bridge) on the other end.
+- **Phase 2 (done -- verified against a real guest kernel):** a
+  hand-rolled, portable subset of the vhost-user + virtio-fs
+  (FUSE-over-virtio) wire protocol (`riftlessfs-proto`) that avoids the
+  Linux-only pieces of the rust-vmm stack: message framing, `SCM_RIGHTS`
+  socket transport, guest memory mapping, split-virtqueue parsing,
+  FUSE-over-virtio wire structs, and a dispatch loop into
+  `riftlessfs-core::PassthroughFs`. See "How this was actually verified"
+  below.
 - **Phase 3 (not started):** a Windows transport. Likely a custom protocol
   over Hyper-V sockets rather than vhost-user, since vhost-user itself
   isn't viable there. Scope/approach TBD.
@@ -89,11 +75,65 @@ Given that, the plan is split into phases:
   OrbStack (macOS-only, so this comparison only makes sense on macOS CI/dev
   hardware) and against stock `virtiofsd` (Linux), using representative
   workloads (`fio` random/sequential I/O, `git status`/`clone`, `tar`,
-  a real compile) -- not synthetic microbenchmarks.
+  a real compile) -- not synthetic microbenchmarks. Nothing in this
+  category exists yet: everything verified so far is *correctness*, not
+  *performance*.
 
-Anyone continuing this work should read this section before assuming the
-vhost-user transport is a small remaining step; it's most of the actual
-engineering effort.
+## How this was actually verified
+
+Getting a real front-end to talk to riftlessfsd surfaced two more
+concrete, non-obvious portability findings, on top of the ones from
+Phase 2:
+
+1. **QEMU's own vhost-user support is Linux-only by default, on *any*
+   host.** Homebrew's macOS QEMU build has no `vhost-user-fs-pci` device
+   at all -- tracked down to `meson.build`:
+   `have_vhost_user = get_option('vhost_user').disable_auto_if(host_os
+   != 'linux')...`. This isn't specific to virtio-fs; it's vhost-user
+   support in QEMU *as a front-end*, for any device. Building QEMU from
+   source with `-Dvhost_user=enabled` works fine on macOS (confirmed:
+   `vhost-user-fs-pci` shows up in `-device help` and works end-to-end),
+   it's just not what you get from a package manager. This means CI/dev
+   verification on macOS needs a custom QEMU build; Linux distributions'
+   packaged QEMU has this enabled by default.
+2. **A cross-platform errno bug that only a real Linux guest could catch.**
+   The very first real mount attempt failed with `fsconfig() failed:
+   Remote address changed` -- a nonsensical error for a local mount,
+   until noticing that Linux's `strerror(78)` is `EREMCHG`
+   ("Remote address changed"), and macOS's `ENOSYS` is *also* 78. Our
+   `GETXATTR` handler correctly replied with `-ENOSYS`, but
+   `libc::ENOSYS` is a **host** errno constant (78 on macOS, 38 on
+   Linux) -- and the FUSE wire protocol is defined by the Linux kernel
+   ABI, so every error code sent over it must be a *Linux* errno number
+   regardless of what platform the daemon itself runs on. Fixed in
+   `riftlessfs-proto::fuse::linux_errno`, which translates host errno
+   values to hardcoded Linux ones at the one point they get written onto
+   the wire (`fuse::wire::OutHeader::error_for`). This is exactly the
+   kind of bug this project's whole premise is about catching early by
+   actually testing across platforms rather than assuming POSIX means
+   "the same everywhere."
+
+With both of those fixed, the following was verified for real, on this
+project's actual dev hardware (Apple Silicon macOS host):
+
+- A QEMU 11.0.2 built from source with `-Dvhost_user=enabled`
+  (`--target-list=aarch64-softmmu`), running with `-accel hvf`.
+- A stock **Fedora Linux 44** aarch64 cloud image (kernel 6.19,
+  unmodified), booted via UEFI, configured with cloud-init.
+- `riftlessfsd` listening on a UNIX socket, with `-device
+  vhost-user-fs-pci` as the QEMU-side client, backed by a
+  `memory-backend-file` shared-memory region (the `memfd`-based backend
+  isn't available on macOS QEMU either, for the same "Linux-only by
+  default" reason, but the plain file-backed one works identically).
+- Inside the guest: `mount -t virtiofs myfs /mnt/rfs` succeeds; creating,
+  writing, reading, and listing files works; an 8 MiB file copied through
+  the mount has a matching `sha256sum` on both sides; `rm`/`rmdir`
+  (including the `ENOTEMPTY` case) and hardlinks work; `umount` is clean.
+
+Anyone continuing this work should still read the module docs in
+`riftlessfs-proto` before assuming everything left is easy: FUSE opcode
+coverage is real but not exhaustive, there's no performance tuning at
+all yet, and Phase 4 (actual OrbStack comparisons) hasn't started.
 
 ## What's implemented today
 
@@ -122,17 +162,19 @@ It is **Unix-only for now** (`riftlessfs_core::PASSTHROUGH_SUPPORTED` is
 
 ### `riftlessfs-proto`
 
-`crates/riftlessfs-proto` implements the vhost-user message framing layer:
-the 12-byte header, payload structs for feature/protocol-feature
-negotiation and vring setup, and a `Connection` type over
-`UnixStream` that correctly attaches/receives `SCM_RIGHTS` file
-descriptors alongside message bytes (tested with a real fd round-trip,
-not just byte layout). See the crate's module docs
-(`crates/riftlessfs-proto/src/lib.rs` and `vhost_user/mod.rs`) for exactly
-what is and isn't implemented -- in short, this crate can speak the
-handshake, but can't yet serve an actual filesystem request. It is
+`crates/riftlessfs-proto` implements the full vhost-user + FUSE-over-virtio
+backend: message framing (12-byte header, payload structs, a
+`Connection` type over `UnixStream` handling `SCM_RIGHTS` fds), guest
+memory mapping (`vhost_user::memory`, including the gpa-vs-user-address
+distinction described above), split-virtqueue parsing
+(`vhost_user::virtqueue`), FUSE-over-virtio wire structs checked against
+the current upstream `fuse.h` (`fuse::wire`), a request dispatcher into
+`riftlessfs-core::PassthroughFs` (`fuse::dispatch`), the host-to-Linux
+errno translation described above (`fuse::linux_errno`), and the event
+loop tying it all together (`vhost_user::server::Server`). This is what's
+been verified end-to-end against a real Fedora 44 guest (see above). It is
 **Unix-only** (`riftlessfs_proto::VHOST_USER_SUPPORTED` is `false` on
-Windows) for the same fd-passing reason as above.
+Windows) for the same fd-passing reason as `riftlessfs-core`.
 
 ### Testing
 
@@ -160,10 +202,34 @@ OrbStack comparisons belong.
 ```
 crates/
   riftlessfs-core   passthrough filesystem engine (Phase 1, implemented)
-  riftlessfs-proto  vhost-user/virtio-fs wire protocol (Phase 2, partial: framing done, virtqueue/FUSE dispatch not)
+  riftlessfs-proto  vhost-user/virtio-fs backend (Phase 2, implemented and verified against a real guest)
   riftlessfsd       daemon binary wiring the above together
   riftlessfs-bench  criterion benchmarks + (future) full-stack benchmark scripts
 ```
+
+## Usage
+
+```sh
+cargo build --release -p riftlessfsd
+./target/release/riftlessfsd --shared-dir /path/to/share --socket-path /tmp/riftlessfs.sock
+```
+
+riftlessfsd listens on `--socket-path` and waits for a vhost-user
+front-end to connect as a client. Point a VMM's vhost-user-fs device at
+that same socket path, e.g. with QEMU:
+
+```
+-object memory-backend-file,id=mem,size=2G,mem-path=/tmp/qemu-mem,share=on
+-numa node,memdev=mem
+-chardev socket,id=char0,path=/tmp/riftlessfs.sock
+-device vhost-user-fs-pci,chardev=char0,tag=myfs
+```
+
+(the memory backend **must** be `share=on`; the guest's RAM has to be
+real shared memory riftlessfsd can `mmap`). Then, inside the guest:
+`mount -t virtiofs myfs /mnt/somewhere`. Note that a stock Homebrew QEMU
+on macOS won't have the `vhost-user-fs-pci` device at all -- see "How
+this was actually verified" above.
 
 ## Development
 

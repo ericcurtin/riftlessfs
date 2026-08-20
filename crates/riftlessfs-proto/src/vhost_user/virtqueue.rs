@@ -13,7 +13,7 @@
 //! rather than the more efficient suppressed-notification scheme -- again,
 //! fine as long as we don't negotiate that feature bit.
 
-use super::memory::GuestMemory;
+use super::memory::{AddrSpace, GuestMemory};
 
 const DESC_LEN: u64 = 16;
 const AVAIL_RING_OFFSET: u64 = 4;
@@ -84,8 +84,10 @@ impl Virtqueue {
     /// Pop the next available descriptor chain's head index, if the guest
     /// has published one we haven't consumed yet.
     pub fn pop_avail(&mut self, mem: &GuestMemory) -> Result<Option<u16>> {
+        // The avail ring's own location is a vring data structure, given
+        // to us as a "user address" (see the `memory` module docs).
         let avail_idx = mem
-            .read_u16(self.avail_addr + 2)
+            .read_u16(AddrSpace::User, self.avail_addr + 2)
             .ok_or(VirtqueueError::OutOfBounds)?;
         if avail_idx == self.last_avail_idx {
             return Ok(None);
@@ -93,14 +95,18 @@ impl Virtqueue {
         let slot = self.last_avail_idx % self.queue_size;
         let ring_offset = AVAIL_RING_OFFSET + slot as u64 * 2;
         let head = mem
-            .read_u16(self.avail_addr + ring_offset)
+            .read_u16(AddrSpace::User, self.avail_addr + ring_offset)
             .ok_or(VirtqueueError::OutOfBounds)?;
         self.last_avail_idx = self.last_avail_idx.wrapping_add(1);
         Ok(Some(head))
     }
 
     /// Walk the descriptor chain starting at `head`, splitting it into
-    /// readable and writable `(addr, len)` segments in order.
+    /// readable and writable `(addr, len)` segments in order. The
+    /// descriptor *table* is read as a "user address" (a vring data
+    /// structure); the buffer addresses stored *inside* each descriptor
+    /// are guest-physical addresses set by the guest's own virtio driver
+    /// -- see the `memory` module docs for why these differ.
     pub fn read_chain(&self, mem: &GuestMemory, head: u16) -> Result<DescChain> {
         let mut chain = DescChain {
             head,
@@ -109,15 +115,17 @@ impl Virtqueue {
         let mut idx = head;
         for _ in 0..MAX_CHAIN_LEN {
             let desc_off = self.desc_addr + idx as u64 * DESC_LEN;
-            let addr = mem.read_u64(desc_off).ok_or(VirtqueueError::OutOfBounds)?;
+            let addr = mem
+                .read_u64(AddrSpace::User, desc_off)
+                .ok_or(VirtqueueError::OutOfBounds)?;
             let len = mem
-                .read_u32(desc_off + 8)
+                .read_u32(AddrSpace::User, desc_off + 8)
                 .ok_or(VirtqueueError::OutOfBounds)?;
             let flags = mem
-                .read_u16(desc_off + 12)
+                .read_u16(AddrSpace::User, desc_off + 12)
                 .ok_or(VirtqueueError::OutOfBounds)?;
             let next = mem
-                .read_u16(desc_off + 14)
+                .read_u16(AddrSpace::User, desc_off + 14)
                 .ok_or(VirtqueueError::OutOfBounds)?;
 
             if flags & VIRTQ_DESC_F_INDIRECT != 0 {
@@ -137,12 +145,13 @@ impl Virtqueue {
         Err(VirtqueueError::ChainTooLong)
     }
 
-    /// Concatenate a chain's readable segments into one buffer.
+    /// Concatenate a chain's readable segments into one buffer. Segment
+    /// addresses are guest-physical (see [`read_chain`](Self::read_chain)).
     pub fn gather_readable(&self, mem: &GuestMemory, chain: &DescChain) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
         for &(addr, len) in &chain.readable {
             buf.extend_from_slice(
-                mem.get_slice(addr, len)
+                mem.get_slice(AddrSpace::Gpa, addr, len)
                     .ok_or(VirtqueueError::OutOfBounds)?,
             );
         }
@@ -153,6 +162,8 @@ impl Virtqueue {
     /// the number of bytes actually written (may be less than
     /// `data.len()` if the chain doesn't have enough writable capacity --
     /// callers should size responses to fit what the guest offered).
+    /// Segment addresses are guest-physical (see
+    /// [`read_chain`](Self::read_chain)).
     pub fn scatter_writable(
         &self,
         mem: &GuestMemory,
@@ -166,7 +177,7 @@ impl Virtqueue {
                 break;
             }
             let n = remaining.len().min(len as usize);
-            mem.get_slice_mut(addr, n as u64)
+            mem.get_slice_mut(AddrSpace::Gpa, addr, n as u64)
                 .ok_or(VirtqueueError::OutOfBounds)?
                 .copy_from_slice(&remaining[..n]);
             remaining = &remaining[n..];
@@ -176,18 +187,24 @@ impl Virtqueue {
     }
 
     /// Publish a completed chain on the used ring and advance its index.
+    /// The used ring's own location is a vring data structure (a "user
+    /// address"), same as the avail ring and descriptor table.
     pub fn push_used(&mut self, mem: &GuestMemory, head: u16, written_len: u32) -> Result<()> {
         let used_idx = mem
-            .read_u16(self.used_addr + 2)
+            .read_u16(AddrSpace::User, self.used_addr + 2)
             .ok_or(VirtqueueError::OutOfBounds)?;
         let slot = used_idx % self.queue_size;
         let elem_off = self.used_addr + USED_RING_OFFSET + slot as u64 * USED_ELEM_LEN;
-        mem.write_u32(elem_off, head as u32)
+        mem.write_u32(AddrSpace::User, elem_off, head as u32)
             .ok_or(VirtqueueError::OutOfBounds)?;
-        mem.write_u32(elem_off + 4, written_len)
+        mem.write_u32(AddrSpace::User, elem_off + 4, written_len)
             .ok_or(VirtqueueError::OutOfBounds)?;
-        mem.write_u16(self.used_addr + 2, used_idx.wrapping_add(1))
-            .ok_or(VirtqueueError::OutOfBounds)?;
+        mem.write_u16(
+            AddrSpace::User,
+            self.used_addr + 2,
+            used_idx.wrapping_add(1),
+        )
+        .ok_or(VirtqueueError::OutOfBounds)?;
         Ok(())
     }
 }
@@ -207,7 +224,10 @@ mod tests {
                                                                                     // Generous fixed-size region: the rings themselves are tiny, and
                                                                                     // tests also place "data" descriptors well past them.
         let total: u64 = 1 << 20;
-        let mem = GuestMemory::new_anonymous_for_test(gpa, total as usize).unwrap();
+        // gpa == user_addr here: these tests focus on descriptor-chain
+        // walking, not the gpa/user-address distinction (which
+        // `memory::tests` covers directly).
+        let mem = GuestMemory::new_anonymous_for_test(gpa, gpa, total as usize).unwrap();
         let vq = Virtqueue::new(queue_size, desc_addr, avail_addr, used_addr);
         (mem, vq)
     }
@@ -222,16 +242,18 @@ mod tests {
         next: u16,
     ) {
         let off = vq.desc_addr + idx as u64 * DESC_LEN;
-        mem.get_slice_mut(off, DESC_LEN).unwrap()[0..8].copy_from_slice(&addr.to_le_bytes());
-        mem.write_u32(off + 8, len).unwrap();
-        mem.write_u16(off + 12, flags).unwrap();
-        mem.write_u16(off + 14, next).unwrap();
+        mem.get_slice_mut(AddrSpace::User, off, DESC_LEN).unwrap()[0..8]
+            .copy_from_slice(&addr.to_le_bytes());
+        mem.write_u32(AddrSpace::User, off + 8, len).unwrap();
+        mem.write_u16(AddrSpace::User, off + 12, flags).unwrap();
+        mem.write_u16(AddrSpace::User, off + 14, next).unwrap();
     }
 
     fn publish_avail(mem: &GuestMemory, vq: &Virtqueue, slot: u16, head: u16, new_idx: u16) {
         let ring_off = vq.avail_addr + AVAIL_RING_OFFSET + slot as u64 * 2;
-        mem.write_u16(ring_off, head).unwrap();
-        mem.write_u16(vq.avail_addr + 2, new_idx).unwrap();
+        mem.write_u16(AddrSpace::User, ring_off, head).unwrap();
+        mem.write_u16(AddrSpace::User, vq.avail_addr + 2, new_idx)
+            .unwrap();
     }
 
     #[test]
@@ -253,7 +275,7 @@ mod tests {
         // Descriptor 1: writable, where we should write our "response".
         write_desc(&mem, &vq, 1, resp_addr, 64, VIRTQ_DESC_F_WRITE, 0);
 
-        mem.get_slice_mut(req_addr, 5)
+        mem.get_slice_mut(AddrSpace::Gpa, req_addr, 5)
             .unwrap()
             .copy_from_slice(b"hello");
         publish_avail(&mem, &vq, 0, 0, 1);
@@ -279,28 +301,29 @@ mod tests {
         let written = vq.scatter_writable(&mem, &chain, response).unwrap();
         assert_eq!(written, response.len() as u32);
         assert_eq!(
-            mem.get_slice(resp_addr, response.len() as u64).unwrap(),
+            mem.get_slice(AddrSpace::Gpa, resp_addr, response.len() as u64)
+                .unwrap(),
             response
         );
 
         vq.push_used(&mem, head, written).unwrap();
-        assert_eq!(mem.read_u16(vq.used_addr + 2), Some(1));
+        assert_eq!(mem.read_u16(AddrSpace::User, vq.used_addr + 2), Some(1));
     }
 
     #[test]
     fn push_used_advances_index_and_records_head_and_len() {
         let (mem, mut vq) = test_queue(4);
         vq.push_used(&mem, 2, 42).unwrap();
-        assert_eq!(mem.read_u16(vq.used_addr + 2), Some(1));
+        assert_eq!(mem.read_u16(AddrSpace::User, vq.used_addr + 2), Some(1));
         let elem_off = vq.used_addr + USED_RING_OFFSET;
-        assert_eq!(mem.read_u32(elem_off), Some(2));
-        assert_eq!(mem.read_u32(elem_off + 4), Some(42));
+        assert_eq!(mem.read_u32(AddrSpace::User, elem_off), Some(2));
+        assert_eq!(mem.read_u32(AddrSpace::User, elem_off + 4), Some(42));
 
         vq.push_used(&mem, 3, 7).unwrap();
-        assert_eq!(mem.read_u16(vq.used_addr + 2), Some(2));
+        assert_eq!(mem.read_u16(AddrSpace::User, vq.used_addr + 2), Some(2));
         let elem_off2 = vq.used_addr + USED_RING_OFFSET + USED_ELEM_LEN;
-        assert_eq!(mem.read_u32(elem_off2), Some(3));
-        assert_eq!(mem.read_u32(elem_off2 + 4), Some(7));
+        assert_eq!(mem.read_u32(AddrSpace::User, elem_off2), Some(3));
+        assert_eq!(mem.read_u32(AddrSpace::User, elem_off2 + 4), Some(7));
     }
 
     #[test]
@@ -313,9 +336,15 @@ mod tests {
         write_desc(&mem, &vq, 0, a, 3, VIRTQ_DESC_F_NEXT, 1);
         write_desc(&mem, &vq, 1, b, 3, VIRTQ_DESC_F_NEXT, 2);
         write_desc(&mem, &vq, 2, c, 3, 0, 0);
-        mem.get_slice_mut(a, 3).unwrap().copy_from_slice(b"foo");
-        mem.get_slice_mut(b, 3).unwrap().copy_from_slice(b"bar");
-        mem.get_slice_mut(c, 3).unwrap().copy_from_slice(b"baz");
+        mem.get_slice_mut(AddrSpace::Gpa, a, 3)
+            .unwrap()
+            .copy_from_slice(b"foo");
+        mem.get_slice_mut(AddrSpace::Gpa, b, 3)
+            .unwrap()
+            .copy_from_slice(b"bar");
+        mem.get_slice_mut(AddrSpace::Gpa, c, 3)
+            .unwrap()
+            .copy_from_slice(b"baz");
         publish_avail(&mem, &vq, 0, 0, 1);
 
         let head = vq.pop_avail(&mem).unwrap().unwrap();

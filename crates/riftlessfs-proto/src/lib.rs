@@ -34,6 +34,8 @@
 pub mod doorbell;
 pub mod error;
 #[cfg(unix)]
+pub mod fuse;
+#[cfg(unix)]
 pub mod vhost_user;
 
 pub use error::{ProtoError, ProtoResult};

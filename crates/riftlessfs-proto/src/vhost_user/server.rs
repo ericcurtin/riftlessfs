@@ -1,0 +1,545 @@
+//! Ties the pieces together: accept a vhost-user connection, negotiate
+//! features, handle `SET_MEM_TABLE`/`SET_VRING_*` to build up
+//! [`GuestMemory`] and per-vring [`Virtqueue`] state, and then run a
+//! blocking event loop that polls the control socket and every enabled
+//! vring's kick fd, dispatching FUSE requests found there to a
+//! [`crate::fuse::dispatch::Session`] and notifying the guest via the
+//! matching call fd.
+//!
+//! This is intentionally simple (single-threaded, one connection, no
+//! event-index/notification-suppression optimization, no live migration
+//! support) -- it's meant to be a correct first version to validate
+//! against a real guest kernel, not a tuned one. See the workspace README
+//! for performance follow-up work once correctness is established.
+
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+
+use crate::error::{ProtoError, ProtoResult};
+use crate::fuse::dispatch::{Reply, Session};
+
+use super::connection::Connection;
+use super::header::{MsgHeader, Request};
+use super::memory::GuestMemory;
+use super::payload::{MemoryRegions, U64Payload, VringAddr, VringFdPayload, VringState};
+use super::virtqueue::Virtqueue;
+
+/// We advertise no optional vhost-user protocol features (no
+/// `REPLY_ACK`, no `MQ`, no `CONFIG`, ...): none of them are needed for a
+/// correct first version, and each one is more surface area to get wrong.
+const PROTOCOL_FEATURES: u64 = 0;
+
+/// Bit 30 (`VHOST_USER_F_PROTOCOL_FEATURES`) tells the front-end we
+/// understand `GET/SET_PROTOCOL_FEATURES` at all.
+const VIRTIO_FEATURES: u64 = 1 << 30;
+
+/// Total vrings: 0 = hiprio, 1 = the (single) request queue. Both are
+/// processed identically by this implementation -- see module docs.
+const NUM_QUEUES: usize = 2;
+
+#[derive(Default)]
+struct VringSlot {
+    queue_size: Option<u16>,
+    pending_avail_base: u16,
+    vq: Option<Virtqueue>,
+    kick_fd: Option<OwnedFd>,
+    call_fd: Option<OwnedFd>,
+    enabled: bool,
+}
+
+impl VringSlot {
+    fn maybe_build(&mut self, addr: &VringAddr) {
+        if let Some(qs) = self.queue_size {
+            let mut vq = Virtqueue::new(qs, addr.descriptor, addr.avail, addr.used);
+            vq.set_avail_base(self.pending_avail_base);
+            self.vq = Some(vq);
+        } else {
+            log::warn!(
+                "SET_VRING_ADDR for index with no prior SET_VRING_NUM; ignoring until one arrives"
+            );
+        }
+    }
+}
+
+pub struct Server {
+    conn: Connection,
+    mem: Option<GuestMemory>,
+    vrings: Vec<VringSlot>,
+    session: Session,
+}
+
+impl Server {
+    pub fn new(conn: Connection, session: Session) -> Self {
+        let mut vrings = Vec::with_capacity(NUM_QUEUES);
+        vrings.resize_with(NUM_QUEUES, VringSlot::default);
+        Server {
+            conn,
+            mem: None,
+            vrings,
+            session,
+        }
+    }
+
+    /// Run the blocking control-message + virtqueue-processing loop until
+    /// the connection is closed.
+    pub fn run(mut self) -> ProtoResult<()> {
+        loop {
+            let mut fds = vec![libc::pollfd {
+                fd: self.conn.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            let mut kick_slots = Vec::new();
+            for (i, slot) in self.vrings.iter().enumerate() {
+                if slot.enabled {
+                    if let Some(kfd) = &slot.kick_fd {
+                        fds.push(libc::pollfd {
+                            fd: kfd.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        });
+                        kick_slots.push(i);
+                    }
+                }
+            }
+
+            let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err.into());
+            }
+
+            if fds[0].revents & libc::POLLIN != 0 {
+                match self.handle_one_message() {
+                    Ok(()) => {}
+                    Err(ProtoError::Disconnected) => return Ok(()),
+                    Err(e) => return Err(e),
+                }
+            }
+            if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                return Ok(());
+            }
+
+            for (slot_idx, pfd) in kick_slots.into_iter().zip(fds.into_iter().skip(1)) {
+                if pfd.revents & libc::POLLIN != 0 {
+                    drain_fd(pfd.fd);
+                    self.process_vring(slot_idx)?;
+                }
+            }
+        }
+    }
+
+    fn process_vring(&mut self, idx: usize) -> ProtoResult<()> {
+        let Some(mem) = &self.mem else { return Ok(()) };
+        let slot = &mut self.vrings[idx];
+        let Some(vq) = &mut slot.vq else {
+            return Ok(());
+        };
+
+        let mut processed = 0;
+        while let Some(head) = vq.pop_avail(mem)? {
+            let chain = vq.read_chain(mem, head)?;
+            let request = vq.gather_readable(mem, &chain)?;
+            let reply = self.session.handle(&request);
+            let written = match reply {
+                Reply::Bytes(bytes) => vq.scatter_writable(mem, &chain, &bytes)?,
+                Reply::None => 0,
+            };
+            vq.push_used(mem, head, written)?;
+            processed += 1;
+        }
+
+        if processed > 0 {
+            if let Some(call_fd) = &slot.call_fd {
+                notify(call_fd.as_raw_fd());
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_one_message(&mut self) -> ProtoResult<()> {
+        let (header, payload, mut fds) = self.conn.recv()?;
+        let Ok(request) = header.request() else {
+            log::warn!(
+                "ignoring unknown vhost-user request code {}",
+                header.request
+            );
+            return Ok(());
+        };
+
+        match request {
+            Request::GetFeatures => {
+                self.reply(request, &U64Payload(VIRTIO_FEATURES).to_bytes())?;
+            }
+            Request::SetFeatures => {
+                let _features = U64Payload::from_bytes(&payload)?.0;
+            }
+            Request::SetOwner | Request::ResetOwner => {}
+            Request::GetProtocolFeatures => {
+                self.reply(request, &U64Payload(PROTOCOL_FEATURES).to_bytes())?;
+            }
+            Request::SetProtocolFeatures => {}
+            Request::GetQueueNum => {
+                self.reply(request, &U64Payload(NUM_QUEUES as u64).to_bytes())?;
+            }
+
+            Request::SetMemTable => {
+                let regions = MemoryRegions::from_bytes(&payload)?;
+                if regions.regions.len() != fds.len() {
+                    return Err(ProtoError::Truncated);
+                }
+                let mem = GuestMemory::map_regions(&regions.regions, &fds)?;
+                fds.clear(); // ownership transferred into GuestMemory's mmaps
+                self.mem = Some(mem);
+            }
+
+            Request::SetVringNum => {
+                let s = VringState::from_bytes(&payload)?;
+                if let Some(slot) = self.vrings.get_mut(s.index as usize) {
+                    slot.queue_size = Some(s.num as u16);
+                }
+            }
+            Request::SetVringAddr => {
+                let a = VringAddr::from_bytes(&payload)?;
+                if let Some(slot) = self.vrings.get_mut(a.index as usize) {
+                    slot.maybe_build(&a);
+                }
+            }
+            Request::SetVringBase => {
+                let s = VringState::from_bytes(&payload)?;
+                if let Some(slot) = self.vrings.get_mut(s.index as usize) {
+                    slot.pending_avail_base = s.num as u16;
+                    if let Some(vq) = &mut slot.vq {
+                        vq.set_avail_base(s.num as u16);
+                    }
+                }
+            }
+            Request::GetVringBase => {
+                let s = VringState::from_bytes(&payload)?;
+                let base = self
+                    .vrings
+                    .get(s.index as usize)
+                    .and_then(|slot| slot.vq.as_ref())
+                    .map(|vq| vq.avail_base())
+                    .unwrap_or(0);
+                self.reply(
+                    request,
+                    &VringState {
+                        index: s.index,
+                        num: base as u32,
+                    }
+                    .to_bytes(),
+                )?;
+            }
+            Request::SetVringKick => {
+                let p = VringFdPayload::from_bytes(&payload)?;
+                if let Some(slot) = self.vrings.get_mut(p.index as usize) {
+                    slot.kick_fd = take_fd(&mut fds, p.no_fd);
+                }
+            }
+            Request::SetVringCall => {
+                let p = VringFdPayload::from_bytes(&payload)?;
+                if let Some(slot) = self.vrings.get_mut(p.index as usize) {
+                    slot.call_fd = take_fd(&mut fds, p.no_fd);
+                }
+            }
+            Request::SetVringErr => {
+                let p = VringFdPayload::from_bytes(&payload)?;
+                let _ = take_fd(&mut fds, p.no_fd); // received, intentionally unused
+            }
+            Request::SetVringEnable => {
+                let s = VringState::from_bytes(&payload)?;
+                if let Some(slot) = self.vrings.get_mut(s.index as usize) {
+                    slot.enabled = s.num != 0;
+                }
+            }
+
+            Request::SetLogBase | Request::SetLogFd => {}
+        }
+
+        Ok(())
+    }
+
+    fn reply(&self, request: Request, body: &[u8]) -> ProtoResult<()> {
+        self.conn
+            .send(MsgHeader::reply(request, body.len() as u32), body, &[])
+    }
+}
+
+fn take_fd(fds: &mut Vec<RawFd>, no_fd: bool) -> Option<OwnedFd> {
+    if no_fd || fds.is_empty() {
+        return None;
+    }
+    let fd = fds.remove(0);
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Drain whatever's pending on a kick fd without assuming anything about
+/// its exact type (real Linux `eventfd`, a pipe, ...) -- any pollable fd
+/// that supports `read()` works here.
+fn drain_fd(fd: RawFd) {
+    let mut buf = [0u8; 256];
+    loop {
+        let rc = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if rc <= 0 {
+            break;
+        }
+        if (rc as usize) < buf.len() {
+            break;
+        }
+    }
+}
+
+/// Notify the guest via a call fd. Same "any pollable fd" caveat as
+/// [`drain_fd`]: a single byte is enough to wake a poller regardless of
+/// whether the fd is a real eventfd (which coalesces counts) or a pipe.
+fn notify(fd: RawFd) {
+    let one: u64 = 1;
+    unsafe {
+        libc::write(fd, &one as *const u64 as *const libc::c_void, 8);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fuse::bytes::Writer;
+    use crate::fuse::wire;
+    use crate::vhost_user::payload::MemoryRegion;
+    use riftlessfs_core::PassthroughFs;
+    use std::os::unix::net::UnixStream;
+
+    fn make_pipe() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    fn init_request(unique: u64) -> Vec<u8> {
+        let mut body = Writer::new();
+        body.u32(7).u32(45).u32(0).u32(0);
+        let body = body.into_vec();
+
+        let mut w = Writer::new();
+        w.u32((wire::IN_HEADER_LEN + body.len()) as u32);
+        w.u32(26); // FUSE_INIT
+        w.u64(unique);
+        w.u64(0); // nodeid
+        w.u32(0).u32(0).u32(0); // uid, gid, pid
+        w.u32(0); // total_extlen + padding
+        w.bytes(&body);
+        w.into_vec()
+    }
+
+    /// Full loop test: drive a `Server` through the real vhost-user
+    /// handshake over an actual `UnixStream::pair()`, set up a real
+    /// shared-memory-backed virtqueue (an anonymous tempfile, mapped
+    /// independently by "our" side and the simulated front-end, exactly
+    /// like a real VMM and backend would each map the same fd), place a
+    /// FUSE INIT request in it, kick, and confirm we get a correctly
+    /// negotiated INIT reply plus a call-fd notification -- all without
+    /// a real VM or kernel.
+    #[test]
+    fn full_handshake_and_one_request_over_a_real_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PassthroughFs::new(dir.path()).unwrap();
+        let session = Session::new(fs);
+
+        let (fe, be) = UnixStream::pair().unwrap();
+        let server = Server::new(Connection::from_stream(be), session);
+        let handle = std::thread::spawn(move || server.run());
+
+        let fe = Connection::from_stream(fe);
+
+        // --- feature negotiation ---
+        fe.send(MsgHeader::new(Request::GetFeatures, 0, 0), &[], &[])
+            .unwrap();
+        let (h, p, _) = fe.recv().unwrap();
+        assert!(h.is_reply());
+        assert_ne!(U64Payload::from_bytes(&p).unwrap().0 & VIRTIO_FEATURES, 0);
+
+        fe.send(
+            MsgHeader::new(Request::SetFeatures, 0, 8),
+            &U64Payload(VIRTIO_FEATURES).to_bytes(),
+            &[],
+        )
+        .unwrap();
+
+        fe.send(MsgHeader::new(Request::GetProtocolFeatures, 0, 0), &[], &[])
+            .unwrap();
+        let (_h, _p, _) = fe.recv().unwrap();
+
+        fe.send(
+            MsgHeader::new(Request::SetProtocolFeatures, 0, 8),
+            &U64Payload(0).to_bytes(),
+            &[],
+        )
+        .unwrap();
+        fe.send(MsgHeader::new(Request::SetOwner, 0, 0), &[], &[])
+            .unwrap();
+
+        // --- shared memory: one 1 MiB anonymous-file-backed region ---
+        let mem_file = tempfile::tempfile().unwrap();
+        let mem_len: u64 = 1 << 20;
+        unsafe { libc::ftruncate(mem_file.as_raw_fd(), mem_len as libc::off_t) };
+        let region = MemoryRegion {
+            guest_phys_addr: 0,
+            memory_size: mem_len,
+            userspace_addr: 0,
+            mmap_offset: 0,
+        };
+        let regions = MemoryRegions {
+            regions: vec![region],
+        };
+        fe.send(
+            MsgHeader::new(Request::SetMemTable, 0, regions.to_bytes().len() as u32),
+            &regions.to_bytes(),
+            &[mem_file.as_raw_fd()],
+        )
+        .unwrap();
+
+        // Our own independent mapping of the same file, standing in for
+        // what a real guest kernel would do with its half of the shared
+        // memory.
+        let guest_mem = GuestMemory::map_regions(&[region], &[mem_file.as_raw_fd()]).unwrap();
+
+        // --- one virtqueue (index 1: the "request" queue) ---
+        const QUEUE_SIZE: u16 = 8;
+        let desc_addr = 0x1000u64;
+        let avail_addr = desc_addr + QUEUE_SIZE as u64 * 16;
+        let used_addr = avail_addr + 4 + QUEUE_SIZE as u64 * 2 + 64;
+        let req_addr = used_addr + 4096;
+        let resp_addr = req_addr + 256;
+
+        fe.send(
+            MsgHeader::new(Request::SetVringNum, 0, 8),
+            &VringState {
+                index: 1,
+                num: QUEUE_SIZE as u32,
+            }
+            .to_bytes(),
+            &[],
+        )
+        .unwrap();
+        fe.send(
+            MsgHeader::new(Request::SetVringAddr, 0, VringAddr::LEN as u32),
+            &VringAddr {
+                index: 1,
+                flags: 0,
+                descriptor: desc_addr,
+                used: used_addr,
+                avail: avail_addr,
+                log: 0,
+            }
+            .to_bytes(),
+            &[],
+        )
+        .unwrap();
+        fe.send(
+            MsgHeader::new(Request::SetVringBase, 0, 8),
+            &VringState { index: 1, num: 0 }.to_bytes(),
+            &[],
+        )
+        .unwrap();
+
+        let (kick_r, kick_w) = make_pipe();
+        let (call_r, call_w) = make_pipe();
+        fe.send(
+            MsgHeader::new(Request::SetVringKick, 0, 8),
+            &VringFdPayload {
+                index: 1,
+                no_fd: false,
+            }
+            .to_bytes(),
+            &[kick_r.as_raw_fd()],
+        )
+        .unwrap();
+        fe.send(
+            MsgHeader::new(Request::SetVringCall, 0, 8),
+            &VringFdPayload {
+                index: 1,
+                no_fd: false,
+            }
+            .to_bytes(),
+            &[call_w.as_raw_fd()],
+        )
+        .unwrap();
+        fe.send(
+            MsgHeader::new(Request::SetVringEnable, 0, 8),
+            &VringState { index: 1, num: 1 }.to_bytes(),
+            &[],
+        )
+        .unwrap();
+        // These were dup'd across the socket; our copies are no longer
+        // needed once sent (except the ends we still use below).
+        drop(kick_r);
+
+        // --- write an INIT request into "guest memory" and kick ---
+        let req = init_request(1);
+        guest_mem
+            .get_slice_mut(req_addr, req.len() as u64)
+            .unwrap()
+            .copy_from_slice(&req);
+
+        // descriptor 0 (readable: the request), descriptor 1 (writable: the reply)
+        let d0 = desc_addr;
+        guest_mem
+            .get_slice_mut(d0, 8)
+            .unwrap()
+            .copy_from_slice(&req_addr.to_le_bytes());
+        guest_mem.write_u32(d0 + 8, req.len() as u32).unwrap();
+        guest_mem.write_u16(d0 + 12, 1 /* NEXT */).unwrap();
+        guest_mem.write_u16(d0 + 14, 1).unwrap();
+        let d1 = desc_addr + 16;
+        guest_mem
+            .get_slice_mut(d1, 8)
+            .unwrap()
+            .copy_from_slice(&resp_addr.to_le_bytes());
+        guest_mem.write_u32(d1 + 8, 4096).unwrap();
+        guest_mem.write_u16(d1 + 12, 2 /* WRITE */).unwrap();
+        guest_mem.write_u16(d1 + 14, 0).unwrap();
+
+        guest_mem.write_u16(avail_addr + 4, 0).unwrap(); // ring[0] = head 0
+        guest_mem.write_u16(avail_addr + 2, 1).unwrap(); // avail.idx = 1
+
+        let one: u64 = 1;
+        unsafe {
+            libc::write(
+                kick_w.as_raw_fd(),
+                &one as *const u64 as *const libc::c_void,
+                8,
+            );
+        }
+
+        // --- wait for the call fd to be notified, then check the used ring + reply ---
+        let mut pfd = [libc::pollfd {
+            fd: call_r.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let rc = unsafe { libc::poll(pfd.as_mut_ptr(), 1, 5000) };
+        assert_eq!(rc, 1, "server should have notified the call fd within 5s");
+        assert_ne!(pfd[0].revents & libc::POLLIN, 0);
+
+        assert_eq!(guest_mem.read_u16(used_addr + 2), Some(1)); // used.idx advanced
+        let used_id = guest_mem.read_u32(used_addr + 4).unwrap();
+        let used_len = guest_mem.read_u32(used_addr + 8).unwrap();
+        assert_eq!(used_id, 0); // head descriptor index
+        assert_eq!(used_len as usize, wire::INIT_OUT_LEN + wire::OUT_HEADER_LEN);
+
+        let reply = guest_mem.get_slice(resp_addr, used_len as u64).unwrap();
+        let err = i32::from_le_bytes(reply[4..8].try_into().unwrap());
+        assert_eq!(err, 0);
+        let major = u32::from_le_bytes(
+            reply[wire::OUT_HEADER_LEN..wire::OUT_HEADER_LEN + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(major, 7);
+
+        drop(fe);
+        handle.join().unwrap().unwrap();
+    }
+}

@@ -17,6 +17,7 @@ use crate::error::{FsError, FsResult};
 use crate::handle::{HandleData, HandleStore};
 use crate::inode::{self, FileKind, InodeData, InodeStore, ROOT_ID};
 
+#[derive(Debug, Clone)]
 pub struct DirEntry {
     pub name: OsString,
     pub ino: u64,

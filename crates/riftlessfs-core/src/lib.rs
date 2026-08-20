@@ -25,7 +25,7 @@ mod passthrough;
 mod platform;
 
 #[cfg(unix)]
-pub use inode::ROOT_ID;
+pub use inode::{FileKind, ROOT_ID};
 #[cfg(unix)]
 pub use passthrough::{DirEntry, PassthroughFs};
 

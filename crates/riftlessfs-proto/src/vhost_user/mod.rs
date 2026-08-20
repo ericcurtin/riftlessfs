@@ -15,4 +15,7 @@
 
 pub mod connection;
 pub mod header;
+pub mod memory;
 pub mod payload;
+pub mod server;
+pub mod virtqueue;

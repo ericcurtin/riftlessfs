@@ -36,6 +36,12 @@ impl Connection {
         Connection { stream }
     }
 
+    /// The underlying socket fd, for polling alongside vring kick fds.
+    pub fn as_raw_fd(&self) -> RawFd {
+        use std::os::fd::AsRawFd;
+        self.stream.as_raw_fd()
+    }
+
     pub fn connect(path: impl AsRef<std::path::Path>) -> io::Result<Self> {
         Ok(Connection::from_stream(UnixStream::connect(path)?))
     }

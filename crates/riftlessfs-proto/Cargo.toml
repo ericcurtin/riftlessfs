@@ -10,6 +10,10 @@ repository.workspace = true
 libc = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+riftlessfs-core = { path = "../riftlessfs-core" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # vhost-user is a UNIX-domain-socket protocol that relies on SCM_RIGHTS

@@ -21,6 +21,10 @@ pub enum ProtoError {
 
     #[error("expected an fd attached to this message, but none was received")]
     MissingFd,
+
+    #[cfg(unix)]
+    #[error("virtqueue error: {0}")]
+    Virtqueue(#[from] crate::vhost_user::virtqueue::VirtqueueError),
 }
 
 pub type ProtoResult<T> = Result<T, ProtoError>;

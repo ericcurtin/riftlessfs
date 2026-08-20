@@ -171,8 +171,15 @@ log "starting QEMU ($QEMU_BIN, accel: $ACCEL)"
   > "$WORKDIR/qemu.log" 2>&1 &
 QEMU_PID=$!
 
-log "waiting for guest to finish (up to 5 minutes)"
-for _ in $(seq 1 300); do
+# Some CI runners (e.g. GitHub-hosted ubuntu-24.04-arm, as of this
+# writing) expose no /dev/kvm at all, forcing a full software-emulated
+# (TCG) boot, which is dramatically slower than real hardware
+# virtualization -- so this needs a generous timeout to avoid being
+# flaky there, even though the KVM-accelerated case usually finishes in
+# well under a minute.
+WAIT_SECONDS=900
+log "waiting for guest to finish (up to $((WAIT_SECONDS / 60)) minutes)"
+for _ in $(seq 1 "$WAIT_SECONDS"); do
   if grep -q "$MARKER_DONE" "$WORKDIR/serial.log" 2>/dev/null; then
     log "PASS: guest reported success"
     grep -q "hello from guest" "$SHARED_DIR/from_guest.txt" || {

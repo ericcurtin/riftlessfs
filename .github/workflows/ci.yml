@@ -74,32 +74,22 @@ jobs:
     runs-on: ${{ matrix.os }}
     # This boots a real Fedora 44 guest under QEMU and mounts riftlessfsd
     # as a real vhost-user-fs backend (see the README's "How this was
-    # actually verified" section) -- it's slow, especially without KVM
-    # (GitHub-hosted runners generally don't expose /dev/kvm, so this
-    # mostly runs under software emulation), so it gets a generous timeout
-    # and runs independently of the fast build-and-test matrix above.
-    timeout-minutes: 30
+    # actually verified" section). It needs KVM to be worth running in
+    # CI: under pure TCG software emulation, a full Fedora boot +
+    # cloud-init + file I/O routinely takes longer than is reasonable for
+    # a CI job (confirmed: it still hadn't finished after a 15-minute
+    # wait). Runners without usable /dev/kvm skip the actual test (see
+    # the "Check for usable KVM" step) rather than running it and either
+    # timing out or being allowed to fail silently.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: linux-x86_64
             os: ubuntu-24.04
-            # x86_64 GitHub-hosted runners expose usable /dev/kvm: this
-            # completes in ~90s and is a real, blocking signal.
-            allow-failure: false
           - name: linux-aarch64
             os: ubuntu-24.04-arm
-            # As of this writing, ubuntu-24.04-arm runners expose no
-            # /dev/kvm at all, forcing pure TCG software emulation, under
-            # which a full Fedora boot + cloud-init + file I/O routinely
-            # exceeds even a 15-minute wait. That's a runner limitation,
-            # not a code problem (the identical scenario passes reliably
-            # under KVM on x86_64, and was verified manually on real
-            # Apple Silicon hardware -- see the README). Don't block CI
-            # on it; it still runs and reports for whenever GitHub adds
-            # KVM support there, or the workload gets optimized for TCG.
-            allow-failure: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -108,21 +98,27 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 qemu-system-arm ovmf qemu-efi-aarch64 genisoimage
-      - name: Allow KVM access
-        # GitHub-hosted Linux runners may expose /dev/kvm but not grant
-        # the runner user access to it by default; without this, the test
-        # script falls back to (much slower) TCG software emulation.
+      - name: Check for usable KVM
+        id: kvm
+        # GitHub-hosted Linux runners may expose /dev/kvm without
+        # granting the runner user access to it (chmod fixes that), or
+        # may not expose it at all (as of this writing, true of
+        # ubuntu-24.04-arm) -- in which case there's nothing to chmod and
+        # this step's "has_kvm" output stays false.
         run: |
           if [ -e /dev/kvm ]; then
             sudo chmod 666 /dev/kvm
+            echo "has_kvm=true" >> "$GITHUB_OUTPUT"
           else
-            echo "/dev/kvm not present on this runner; will use TCG"
+            echo "/dev/kvm not present on this runner; skipping the QEMU integration test"
+            echo "has_kvm=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Cache Fedora cloud image
+        if: steps.kvm.outputs.has_kvm == 'true'
         uses: actions/cache@v4
         with:
           path: ~/.cache/riftlessfs-qemu-test
           key: fedora-cloud-44-${{ matrix.name }}
       - name: Run QEMU integration test
-        continue-on-error: ${{ matrix.allow-failure }}
+        if: steps.kvm.outputs.has_kvm == 'true'
         run: ./scripts/qemu-integration-test.sh

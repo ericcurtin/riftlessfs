@@ -65,7 +65,14 @@ if [ ! -e /dev/kvm ] || [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
   exit 1
 fi
 
-command -v virtiofsd >/dev/null || { echo "virtiofsd not found (apt-get install virtiofsd)" >&2; exit 1; }
+VIRTIOFSD_BIN="$(first_existing /usr/libexec/virtiofsd /usr/lib/qemu/virtiofsd)" || {
+  VIRTIOFSD_BIN="$(command -v virtiofsd || true)"
+}
+if [ -z "$VIRTIOFSD_BIN" ]; then
+  echo "virtiofsd not found (apt-get install virtiofsd); looked in \$PATH, /usr/libexec, /usr/lib/qemu" >&2
+  exit 1
+fi
+log "using virtiofsd: $VIRTIOFSD_BIN"
 
 RIFTLESSFSD_BIN="${RIFTLESSFSD_BIN:-$(dirname "$0")/../target/release/riftlessfsd}"
 if [ ! -x "$RIFTLESSFSD_BIN" ]; then
@@ -135,7 +142,7 @@ PIDS+=("$!")
 
 log "starting virtiofsd (shared-dir: $WORKDIR/share-virtiofsd)"
 rm -f "$WORKDIR/virtiofsd.sock"
-sudo virtiofsd --socket-path "$WORKDIR/virtiofsd.sock" --shared-dir "$WORKDIR/share-virtiofsd" \
+sudo "$VIRTIOFSD_BIN" --socket-path "$WORKDIR/virtiofsd.sock" --shared-dir "$WORKDIR/share-virtiofsd" \
   --cache=auto --writeback --sandbox none --log-level info \
   > "$WORKDIR/virtiofsd-daemon.log" 2>&1 &
 PIDS+=("$!")

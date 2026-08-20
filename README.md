@@ -130,6 +130,17 @@ project's actual dev hardware (Apple Silicon macOS host):
   the mount has a matching `sha256sum` on both sides; `rm`/`rmdir`
   (including the `ENOTEMPTY` case) and hardlinks work; `umount` is clean.
 
+This same scenario is automated in `scripts/qemu-integration-test.sh` and
+runs in CI (the `qemu-integration` job) on Linux x86_64 and aarch64
+runners using each distro's packaged QEMU. It passes reliably (~90s) on
+the x86_64 runner, which has usable `/dev/kvm`. The aarch64 runner
+(`ubuntu-24.04-arm`, as of this writing) exposes no `/dev/kvm` at all,
+forcing pure TCG software emulation, under which a full Fedora boot +
+cloud-init + file I/O routinely exceeds even a 15-minute wait; that job
+is allowed to fail without blocking CI (it's a runner limitation, not a
+code issue -- the identical scenario is what was verified manually on
+real Apple Silicon hardware above).
+
 Anyone continuing this work should still read the module docs in
 `riftlessfs-proto` before assuming everything left is easy: FUSE opcode
 coverage is real but not exhaustive, there's no performance tuning at

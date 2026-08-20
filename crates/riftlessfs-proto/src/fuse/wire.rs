@@ -280,14 +280,35 @@ impl InitIn {
 /// a conservative, widely-used value.
 pub const MAX_WRITE: u32 = 128 * 1024;
 
-/// `struct fuse_init_out`, sized and populated per [`INIT_OUT_MINOR`]/no
-/// optional flags.
+/// Without this, the guest kernel doesn't coalesce dirty pages before
+/// sending `WRITE` requests: every buffered `write()` syscall, regardless
+/// of size, gets flushed as its own synchronous page-sized (4 KiB) FUSE
+/// request. Measured impact (see BENCHMARKS.md): sequential 1 MiB writes
+/// and random 4 KiB writes achieved almost identical MiB/s without this
+/// flag -- the signature of every write being split into individual 4 KiB
+/// round trips regardless of the application's actual request size.
+///
+/// This is a bigger behavioral change than the other flags here (the
+/// kernel now owns dirty-page/size coherency until writeback), so it's
+/// worth being explicit about what was checked before enabling it:
+/// `riftlessfs-core`'s own operations don't buffer writes themselves
+/// (every `WRITE` request we do receive is immediately `pwrite()`'d to
+/// the real file), so from our side there's no new buffering to get
+/// wrong; the risk is entirely in trusting the kernel's writeback
+/// behavior on the other side of the wire. Verified after enabling: the
+/// full `cargo test --workspace` suite still passes, and
+/// `scripts/qemu-integration-test.sh`'s 8 MiB file copy still produces a
+/// matching `sha256sum` on both sides of a real mount.
+const FUSE_WRITEBACK_CACHE: u32 = 1 << 16;
+
+/// `struct fuse_init_out`, sized and populated per [`INIT_OUT_MINOR`] and
+/// the flags above.
 pub fn init_out(max_readahead: u32) -> Vec<u8> {
     let mut w = Writer::new();
     w.u32(7); // major
     w.u32(INIT_OUT_MINOR);
     w.u32(max_readahead);
-    w.u32(0); // flags: none of the optional features
+    w.u32(FUSE_WRITEBACK_CACHE);
     w.u16(0); // max_background
     w.u16(0); // congestion_threshold
     w.u32(MAX_WRITE);

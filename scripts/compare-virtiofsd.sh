@@ -117,7 +117,9 @@ users:
     ssh_authorized_keys:
       - $(cat "$WORKDIR/key.pub")
 ssh_pwauth: false
+package_update: false
 runcmd:
+  - dnf install -y fio
   - mkdir -p /mnt/riftless /mnt/virtiofsd
   - mount -t virtiofs riftless /mnt/riftless
   - mount -t virtiofs virtiofsd /mnt/virtiofsd

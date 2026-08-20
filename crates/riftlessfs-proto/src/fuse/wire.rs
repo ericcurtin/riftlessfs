@@ -301,6 +301,16 @@ pub const MAX_WRITE: u32 = 128 * 1024;
 /// matching `sha256sum` on both sides of a real mount.
 const FUSE_WRITEBACK_CACHE: u32 = 1 << 16;
 
+/// Lets the kernel issue readahead (and potentially other read) requests
+/// without waiting for each one's reply before sending the next, instead
+/// of one strictly synchronous request at a time. `Server::process_vring`
+/// already drains and processes every descriptor chain available in a
+/// single kick before notifying once (see its docs), so this composes
+/// naturally with the existing loop: without this flag the kernel simply
+/// never gives us more than one outstanding read to batch in the first
+/// place.
+const FUSE_ASYNC_READ: u32 = 1 << 0;
+
 /// `struct fuse_init_out`, sized and populated per [`INIT_OUT_MINOR`] and
 /// the flags above.
 pub fn init_out(max_readahead: u32) -> Vec<u8> {
@@ -308,7 +318,7 @@ pub fn init_out(max_readahead: u32) -> Vec<u8> {
     w.u32(7); // major
     w.u32(INIT_OUT_MINOR);
     w.u32(max_readahead);
-    w.u32(FUSE_WRITEBACK_CACHE);
+    w.u32(FUSE_WRITEBACK_CACHE | FUSE_ASYNC_READ);
     w.u16(0); // max_background
     w.u16(0); // congestion_threshold
     w.u32(MAX_WRITE);
@@ -475,10 +485,22 @@ impl CreateIn {
     }
 }
 
+/// `FOPEN_KEEP_CACHE`: don't invalidate the guest's cached pages for this
+/// file just because it was newly opened. Without this, every `open()`
+/// (even a second one from the same process, e.g. a rename-through-temp-
+/// file build tool pattern) throws away whatever's cached, forcing full
+/// re-reads. Safe for riftlessfs to always set: we don't yet do our own
+/// invalidation notifications, but we also don't have any *other* writer
+/// racing with the guest in the common case (the file lives on the host,
+/// modified either by the guest through us, or from the host directly --
+/// the latter already isn't coherently observed promptly given the
+/// attribute cache timeout, so this doesn't newly weaken anything).
+const FOPEN_KEEP_CACHE: u32 = 1 << 1;
+
 pub fn open_out(fh: u64) -> Vec<u8> {
     let mut w = Writer::new();
     w.u64(fh);
-    w.u32(0); // open_flags
+    w.u32(FOPEN_KEEP_CACHE);
     w.i32(0); // backing_id
     w.into_vec()
 }

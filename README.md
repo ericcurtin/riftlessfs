@@ -16,16 +16,18 @@ below for exactly what was tested and how.
 What's *not* true yet: **riftlessfs does not beat OrbStack.** Real,
 head-to-head benchmarks now exist (see [BENCHMARKS.md](BENCHMARKS.md),
 Phase 4) -- comparing riftlessfs against OrbStack, same guest OS, same
-hardware, same workloads. Two real performance bugs were found and fixed
-*by* that benchmarking pass (a disabled attribute cache, and a missing
-`FUSE_WRITEBACK_CACHE` flag), taking sequential write throughput from
-~100x behind OrbStack to ~5x behind, with random write now *ahead* of
-OrbStack in that comparison -- real progress, driven by data, not yet a
-win. Reads remain far behind (7.6-37x) and are next. Windows has no
-transport at all (see Phase 3), and FUSE opcode coverage, while enough
-for real everyday use, isn't exhaustive (xattrs, POSIX locks, and a few
-other opcodes currently reply `ENOSYS`). This README stays explicit about
-what's proven versus what isn't, so nobody mistakes "it mounts, and is
+hardware, same workloads. Three real performance bugs/gaps were found and
+fixed *by* that benchmarking pass (a disabled attribute cache, a missing
+`FUSE_WRITEBACK_CACHE` flag, and missing `FUSE_ASYNC_READ`/
+`FOPEN_KEEP_CACHE`), taking sequential write throughput from ~100x behind
+OrbStack to ~5x behind (with random write briefly *ahead* of OrbStack in
+one comparison) and sequential read from 7.6x behind to 3.6x -- real
+progress, driven by data, not yet a win. Random I/O in particular remains
+far behind. Windows has no transport at all (see Phase 3), and FUSE
+opcode coverage, while enough for real everyday use, isn't exhaustive
+(xattrs, POSIX locks, and a few other opcodes currently reply `ENOSYS`).
+This README stays explicit about what's proven versus what isn't, so
+nobody mistakes "it mounts, and is
 correct, and is a lot closer on writes than it was" for "this beats
 OrbStack."
 
@@ -82,16 +84,18 @@ Given that, the plan is split into phases:
 - **Phase 4 (in progress -- gap narrowing, still losing):** real,
   head-to-head benchmarks against OrbStack, same guest OS (Fedora 44) and
   hardware for both sides. See [BENCHMARKS.md](BENCHMARKS.md) for full
-  results and analysis. Two real bugs found and fixed *by* this
+  results and analysis. Three real bugs/gaps found and fixed *by* this
   benchmarking pass so far: attribute/entry caching was disabled entirely
   (a synthetic "stat 2000 files" benchmark was ~60x slower than it needed
-  to be), and `FUSE_WRITEBACK_CACHE` wasn't advertised (every write,
+  to be); `FUSE_WRITEBACK_CACHE` wasn't advertised (every write,
   regardless of application request size, became an individual
-  synchronous 4 KiB round trip). Fixing both took sequential write
-  throughput from ~100x behind OrbStack to ~5x behind, and random write
-  is now *ahead* of OrbStack in this single-run comparison. Reads are
-  untouched by either fix and are now the largest relative gap (7.6x
-  sequential, 37x random). Comparison against stock `virtiofsd` (Linux)
+  synchronous 4 KiB round trip), fixing which took sequential write
+  throughput from ~100x behind OrbStack to ~5x behind; and
+  `FUSE_ASYNC_READ`/`FOPEN_KEEP_CACHE` weren't set, fixing which took
+  sequential read from 7.6x behind to 3.6x. Random I/O remains the
+  largest relative gap, bounded by genuine per-request round-trip
+  latency rather than a caching/flag problem. Comparison against stock
+  `virtiofsd` (Linux)
   hasn't been done yet.
 
 ## How this was actually verified

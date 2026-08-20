@@ -507,6 +507,10 @@ pub fn write_out(size: u32) -> Vec<u8> {
     w.into_vec()
 }
 
+// `libc::statvfs` field widths vary by platform (e.g. these are `u32` on
+// macOS but already `u64`/wider on Linux/glibc), so these casts are
+// meaningful on some targets and a harmless no-op on others.
+#[allow(clippy::unnecessary_cast)]
 pub fn statfs_out(stat: &libc::statvfs) -> Vec<u8> {
     let mut w = Writer::new();
     w.u64(stat.f_blocks as u64);

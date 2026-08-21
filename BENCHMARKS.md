@@ -284,24 +284,86 @@ moved *relative to the other backend on the same run*:
   the run-to-run noise just described, treat this as "still roughly
   equal," not as a new win to bank on.
 
+### Following up on the random-write gap: a second, real protocol bug
+
+Investigating "why didn't `max_write` help random write" (rather than
+guessing) meant instrumenting `fuse::dispatch::Session::handle` to log
+the actual size of every `pwrite()`/`pread()` reaching the backend (see
+its `log::trace!` calls), then running fio directly against a local
+riftlessfsd + real QEMU/KVM (HVF, locally) guest and reading the trace.
+That turned up a second, independent bug: **every write -- sequential
+*or* random -- was capped at exactly 131072 bytes (128 KiB), even though
+`max_write` had already been raised to 1 MiB.**
+
+The reason: per the FUSE kernel ABI (`include/uapi/linux/fuse.h`), the
+field that governs how much dirty writeback-cached data the kernel
+batches into one `WRITE` request is `max_pages`, not `max_write` --  and
+`max_pages` is silently ignored unless the `FUSE_MAX_PAGES` init flag is
+also set. riftlessfsd was setting `max_write` but never `max_pages` or
+its flag, so the kernel fell back to its own built-in default of 32
+pages (128 KiB) for writeback batching purposes, regardless of what
+`max_write` said. Fixed by advertising `FUSE_MAX_PAGES` with
+`max_pages` covering the full `max_write` (see `fuse::wire::init_out`).
+
+Verified directly (not just inferred) by re-tracing after the fix:
+sequential-write `pwrite()` calls jumped from capped-at-131072-bytes to
+mostly exactly 1048576 bytes (1 MiB) -- a ~7.5x reduction in syscall
+(and, more importantly, virtio round-trip) count for the same data
+volume. Random write's `pwrite()` sizes, by contrast, stayed mostly at
+4096 bytes even after the fix (only a small tail coalesced up to ~28
+KiB) -- which makes sense and is an important negative result in its
+own right: writeback can only merge writes that end up *physically
+adjacent in the file* by the time a flush happens, and a genuinely
+random access pattern offers little of that no matter how generous the
+batching ceiling is. So this fix is expected to help sequential
+(and any workload with real locality) substantially, but **random
+write's gap was never explained by our own `max_write`/`max_pages`
+settings being wrong** -- with those now correct on our side, whatever
+gap remains against virtiofsd on truly-random, mostly-4-KiB-request
+writes needs a different explanation (see next steps).
+
+This was also a useful lesson in verification: the earlier `max_write`
+fix's changelog claimed it closed part of the write gap, and it did (the
+measured throughput numbers improved) -- but nobody had actually
+confirmed *why* by checking real wire sizes until this pass, and it
+turned out `max_write` alone wasn't even taking effect for writeback
+batching the way it looks like it should from reading the constant
+alone. Added `init_out_advertises_max_pages_matching_max_write` (in
+`fuse::wire`) as a regression test so this can't silently regress again.
+CI (fmt/build/test/clippy) verified green and a real 64 MiB
+copy-and-`sha256sum` round trip through the local QEMU guest still
+matches after the change. A fresh `compare-virtiofsd.yml` run is needed
+to get the real before/after numbers on the actual comparison hardware
+-- local (macOS/HVF) throughput numbers were too noisy run-to-run to be
+worth reporting here directly, but the *mechanism* (syscall size and
+count) was directly observed and isn't in question.
+
 ## Next steps (in priority order)
 
-1. **Investigate the *random write* gap specifically** now that
-   `max_write` is ruled out as the explanation (it closed the sequential
-   write gap but not this one) -- profile it the same way the random-read
-   latency investigation was done above, rather than guessing at another
-   flag or constant to tweak.
-2. **Add repeatability to this benchmark suite**: multiple runs with
+1. **Run `compare-virtiofsd.yml` again** to get real before/after
+   numbers for the `max_pages` fix above on the actual comparison
+   hardware, particularly whether it moves sequential write further
+   (expected) and confirms random write is unaffected (expected, but
+   should be checked rather than assumed).
+2. **Investigate the *random write* gap specifically**, now that two
+   independent protocol-level explanations (`max_write`, `max_pages`)
+   have been checked and fixed on our side without closing it -- profile
+   it the same way the random-read latency investigation was done above
+   (per-request backend timing already exists via `log::trace!` in
+   `fuse::dispatch::Session::handle`; what's missing is doing the same
+   for the *transport* side of a real random-write run specifically),
+   rather than guessing at another flag or constant to tweak.
+3. **Add repeatability to this benchmark suite**: multiple runs with
    variance reported. The run-to-run noise between the two virtiofsd
    comparison runs above (visible in both backends' absolute numbers)
    makes this the most concretely-justified item on this list, not just
    a generic caveat anymore.
-3. **Revisit attribute cache and `FOPEN_KEEP_CACHE` policy once there's
+4. **Revisit attribute cache and `FOPEN_KEEP_CACHE` policy once there's
    real cache invalidation.** Both are currently unconditional with no
    active invalidation (e.g. on a rename/unlink another client might
    have cached, or a host-side write outside riftlessfsd), which matters
    more with multiple guests or host-side writers involved.
-4. **Investigate DAX/shared-memory-style reads** if (1) doesn't turn up
+5. **Investigate DAX/shared-memory-style reads** if (2) doesn't turn up
    a more targeted explanation -- a materially larger undertaking than
    anything done so far.
 

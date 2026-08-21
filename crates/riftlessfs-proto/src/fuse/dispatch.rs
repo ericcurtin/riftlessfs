@@ -246,14 +246,25 @@ impl Session {
 
             Opcode::Read => {
                 let r = try_parse!(wire::ReadIn::from_bytes(body));
+                // Isolates the underlying `pread` syscall's own cost from
+                // everything else in the request's round trip (virtqueue
+                // parsing, guest-memory gather/scatter, notification) --
+                // see the random-write investigation in BENCHMARKS.md,
+                // which needed to know whether the write-vs-read
+                // throughput gap versus virtiofsd is *inside* this
+                // syscall or somewhere else in the pipeline.
+                let t0 = std::time::Instant::now();
                 let data = try_fs!(self.fs.read(r.fh, r.offset, r.size as usize));
+                log::trace!("pread({} bytes) took {:?}", data.len(), t0.elapsed());
                 ok_reply(unique, data)
             }
 
             Opcode::Write => {
                 let (w, data) = try_parse!(wire::WriteIn::from_bytes(body));
                 let n = (w.size as usize).min(data.len());
+                let t0 = std::time::Instant::now();
                 let written = try_fs!(self.fs.write(w.fh, w.offset, &data[..n]));
+                log::trace!("pwrite({n} bytes) took {:?}", t0.elapsed());
                 ok_reply(unique, wire::write_out(written as u32))
             }
 

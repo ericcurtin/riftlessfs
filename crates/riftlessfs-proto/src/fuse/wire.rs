@@ -20,10 +20,11 @@ pub const OUT_HEADER_LEN: usize = 16;
 
 /// The minor protocol version we claim in our `FUSE_INIT` reply. Chosen to
 /// be well past the ancient "compat" struct sizes (so we always send the
-/// same, full `fuse_init_out`) but conservative on features: we advertise
-/// no optional flags (no writeback cache, no readdirplus, no posix ACLs,
-/// ...), so none of the minor-gated behavior newer than this actually
-/// matters.
+/// same, full `fuse_init_out`) and past the handful of optional flags we
+/// do advertise (writeback cache, async read, max_pages -- see
+/// `init_out`'s body); everything else minor-gated newer than this still
+/// doesn't matter, since we don't advertise it (no readdirplus, no posix
+/// ACLs, ...).
 pub const INIT_OUT_MINOR: u32 = 31;
 pub const INIT_OUT_LEN: usize = 64;
 
@@ -319,6 +320,25 @@ const FUSE_WRITEBACK_CACHE: u32 = 1 << 16;
 /// place.
 const FUSE_ASYNC_READ: u32 = 1 << 0;
 
+/// Without this, `max_pages` below is ignored entirely and the kernel
+/// falls back to its own internal default of 32 pages (128 KiB) per
+/// request when deciding how much dirty, writeback-cached data to batch
+/// into a single `WRITE` -- *regardless* of `max_write` above. This was
+/// found by tracing actual `pwrite()` sizes reaching the backend (see
+/// BENCHMARKS.md's random-write investigation): every write, sequential
+/// or random, was capped at exactly 131072 bytes even after `max_write`
+/// was raised to 1 MiB, which only makes sense if the kernel was
+/// silently ignoring it for writeback-batching purposes. `max_pages`
+/// (not `max_write`) is the field that actually governs that batching.
+const FUSE_MAX_PAGES: u32 = 1 << 22;
+
+/// 4 KiB is the only page size that matters here: the guest kernels this
+/// has been tested against (see BENCHMARKS.md, `qemu-integration-test.sh`)
+/// are all aarch64/x86_64 Linux with 4 KiB pages. If a 16 KiB/64 KiB-page
+/// guest kernel ever needs supporting, this would need to come from
+/// negotiation rather than being assumed.
+const ASSUMED_GUEST_PAGE_SIZE: u32 = 4096;
+
 /// `struct fuse_init_out`, sized and populated per [`INIT_OUT_MINOR`] and
 /// the flags above.
 pub fn init_out(max_readahead: u32) -> Vec<u8> {
@@ -326,7 +346,7 @@ pub fn init_out(max_readahead: u32) -> Vec<u8> {
     w.u32(7); // major
     w.u32(INIT_OUT_MINOR);
     w.u32(max_readahead);
-    w.u32(FUSE_WRITEBACK_CACHE | FUSE_ASYNC_READ);
+    w.u32(FUSE_WRITEBACK_CACHE | FUSE_ASYNC_READ | FUSE_MAX_PAGES);
     // Matching virtiofsd: max out how many background (writeback)
     // requests the kernel will queue before throttling the writer,
     // rather than the previous 0 (which, per the FUSE ABI, doesn't mean
@@ -338,7 +358,7 @@ pub fn init_out(max_readahead: u32) -> Vec<u8> {
     w.u16((u16::MAX / 4) * 3); // congestion_threshold
     w.u32(MAX_WRITE);
     w.u32(1); // time_gran: 1ns (we report real nanosecond timestamps)
-    w.u16(0); // max_pages (feature not advertised, kernel ignores)
+    w.u16((MAX_WRITE / ASSUMED_GUEST_PAGE_SIZE) as u16); // max_pages
     w.u16(0); // map_alignment
     w.u32(0); // flags2
     w.u32(0); // max_stack_depth
@@ -682,3 +702,53 @@ pub const DT_UNKNOWN: u32 = 0;
 pub const DT_DIR: u32 = 4;
 pub const DT_REG: u32 = 8;
 pub const DT_LNK: u32 = 10;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for a real bug found by tracing actual `pwrite()`
+    /// sizes reaching the backend against a live guest (see
+    /// BENCHMARKS.md's random-write investigation): `max_write` alone
+    /// does *not* govern how much dirty writeback-cached data the guest
+    /// kernel batches into one `WRITE` request -- `max_pages` does, and
+    /// it's silently ignored unless `FUSE_MAX_PAGES` is also set. Without
+    /// this flag, every write was capped at exactly 128 KiB (32 pages,
+    /// the kernel's built-in default) no matter how large `max_write`
+    /// was. This test parses the actual reply bytes (not just the
+    /// constants that produced them) so a future edit that sets the flag
+    /// but forgets the field (or vice versa) fails loudly.
+    #[test]
+    fn init_out_advertises_max_pages_matching_max_write() {
+        let bytes = init_out(0);
+        assert_eq!(bytes.len(), INIT_OUT_LEN);
+
+        let mut r = Reader::new(&bytes);
+        let _major = r.u32().unwrap();
+        let minor = r.u32().unwrap();
+        let _max_readahead = r.u32().unwrap();
+        let flags = r.u32().unwrap();
+        let _max_background = r.u16().unwrap();
+        let _congestion_threshold = r.u16().unwrap();
+        let max_write = r.u32().unwrap();
+        let _time_gran = r.u32().unwrap();
+        let max_pages = r.u16().unwrap();
+
+        assert!(
+            minor >= 28,
+            "FUSE_MAX_PAGES/max_pages require minor >= 28, got {minor}"
+        );
+        assert_ne!(
+            flags & FUSE_MAX_PAGES,
+            0,
+            "FUSE_MAX_PAGES flag must be set for max_pages to not be silently ignored"
+        );
+        assert_eq!(max_write, MAX_WRITE);
+        assert_eq!(
+            max_pages as u32 * ASSUMED_GUEST_PAGE_SIZE,
+            MAX_WRITE,
+            "max_pages must cover the full max_write, or writeback batching \
+             is capped below what max_write advertises"
+        );
+    }
+}

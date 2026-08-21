@@ -190,6 +190,20 @@ impl Server {
         }
 
         if processed > 0 {
+            // How many requests were available to drain in one wake-up,
+            // i.e. how well the guest's own submission pattern batches
+            // *before* kicking us -- each separate wake-up pays the
+            // external (VM exit/entry, scheduler) latency documented
+            // above regardless of how many requests it contains, so a
+            // workload issuing many small batches pays that cost far
+            // more often than one issuing few large batches. Relevant to
+            // the random-write investigation in BENCHMARKS.md: it's a
+            // candidate explanation for why random write (presumably
+            // small, frequent writeback batches) fares worse than
+            // sequential write (presumably fewer, larger ones) even
+            // though single-request round-trip latency alone doesn't
+            // differ between reads and writes.
+            log::trace!("vring {idx}: drained batch of {processed} request(s)");
             if let Some(call_fd) = &slot.call_fd {
                 notify(call_fd.as_raw_fd());
             }

@@ -51,6 +51,122 @@ fn create_write_read_roundtrip() {
 }
 
 #[test]
+fn write_vectored_gathers_multiple_iovecs_into_one_write() {
+    let (dir, fs) = fs_in_tempdir();
+    let (_ino, handle, _) = fs
+        .create(
+            ROOT_ID,
+            OsStr::new("vectored_write.txt"),
+            libc::O_RDWR,
+            0o644,
+        )
+        .unwrap();
+
+    // Three separate buffers, as if they were three separate guest-memory
+    // descriptors -- write_vectored should write them contiguously via a
+    // single pwritev(), not require them to already be concatenated.
+    let a = b"hello, ";
+    let b = b"vectored ";
+    let c = b"world";
+    let iov = [
+        libc::iovec {
+            iov_base: a.as_ptr() as *mut libc::c_void,
+            iov_len: a.len(),
+        },
+        libc::iovec {
+            iov_base: b.as_ptr() as *mut libc::c_void,
+            iov_len: b.len(),
+        },
+        libc::iovec {
+            iov_base: c.as_ptr() as *mut libc::c_void,
+            iov_len: c.len(),
+        },
+    ];
+    let expected: Vec<u8> = a.iter().chain(b).chain(c).copied().collect();
+
+    let n = fs.write_vectored(handle, 0, &iov).unwrap();
+    assert_eq!(n, expected.len());
+    fs.fsync(handle).unwrap();
+
+    let on_disk = std::fs::read(dir.path().join("vectored_write.txt")).unwrap();
+    assert_eq!(on_disk, expected);
+    fs.release(handle).unwrap();
+}
+
+#[test]
+fn read_vectored_scatters_one_read_into_multiple_iovecs() {
+    let (_dir, fs) = fs_in_tempdir();
+    let (_ino, handle, _) = fs
+        .create(
+            ROOT_ID,
+            OsStr::new("vectored_read.txt"),
+            libc::O_RDWR,
+            0o644,
+        )
+        .unwrap();
+    let full = b"0123456789abcdef";
+    fs.write(handle, 0, full).unwrap();
+    fs.fsync(handle).unwrap();
+
+    // Three separate destination buffers of 5, 5, and 6 bytes -- should
+    // be filled in order by a single preadv(), just like a request whose
+    // reply spans multiple guest-memory descriptors.
+    let mut buf_a = [0u8; 5];
+    let mut buf_b = [0u8; 5];
+    let mut buf_c = [0u8; 6];
+    let iov = [
+        libc::iovec {
+            iov_base: buf_a.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buf_a.len(),
+        },
+        libc::iovec {
+            iov_base: buf_b.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buf_b.len(),
+        },
+        libc::iovec {
+            iov_base: buf_c.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buf_c.len(),
+        },
+    ];
+
+    let n = fs.read_vectored(handle, 0, &iov).unwrap();
+    assert_eq!(n, full.len());
+    assert_eq!(&buf_a, &full[0..5]);
+    assert_eq!(&buf_b, &full[5..10]);
+    assert_eq!(&buf_c, &full[10..16]);
+    fs.release(handle).unwrap();
+}
+
+#[test]
+fn read_vectored_at_offset_and_past_eof_matches_read() {
+    let (_dir, fs) = fs_in_tempdir();
+    let (_ino, handle, _) = fs
+        .create(
+            ROOT_ID,
+            OsStr::new("vectored_read_eof.txt"),
+            libc::O_RDWR,
+            0o644,
+        )
+        .unwrap();
+    fs.write(handle, 0, b"0123456789").unwrap();
+    fs.fsync(handle).unwrap();
+
+    // Ask for 8 bytes starting at offset 6, i.e. 4 real bytes ("6789")
+    // followed by running off the end of the file -- preadv should
+    // return a short count (4), not an error, matching plain pread()'s
+    // short-read-at-EOF behavior.
+    let mut buf = [0xffu8; 8];
+    let iov = [libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    }];
+    let n = fs.read_vectored(handle, 6, &iov).unwrap();
+    assert_eq!(n, 4);
+    assert_eq!(&buf[0..4], b"6789");
+    fs.release(handle).unwrap();
+}
+
+#[test]
 fn mkdir_lookup_readdir_rmdir() {
     let (_dir, fs) = fs_in_tempdir();
     let (sub_ino, attr) = fs.mkdir(ROOT_ID, OsStr::new("subdir"), 0o755).unwrap();

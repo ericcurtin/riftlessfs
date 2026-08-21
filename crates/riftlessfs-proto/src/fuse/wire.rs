@@ -100,6 +100,23 @@ impl OutHeader {
             &[],
         )
     }
+
+    /// Build just the `fuse_out_header` bytes for a successful reply
+    /// whose body lives *elsewhere* (already written directly into
+    /// guest memory, e.g. by a zero-copy `READ` that `preadv()`s
+    /// straight past where this header goes -- see
+    /// `Server::process_vring`) rather than being passed in as a
+    /// `body: &[u8]` the way [`reply`](Self::reply) expects.
+    /// `total_len` is the *whole* reply's length as the guest will see
+    /// it (`OUT_HEADER_LEN` + however many payload bytes were written
+    /// separately), not just this header's own size.
+    pub fn success_header_only(unique: u64, total_len: u32) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u32(total_len);
+        w.i32(0);
+        w.u64(unique);
+        w.into_vec()
+    }
 }
 
 /// Opcodes riftlessfsd has specific handling for. Anything else observed
@@ -750,5 +767,27 @@ mod tests {
             "max_pages must cover the full max_write, or writeback batching \
              is capped below what max_write advertises"
         );
+    }
+
+    /// `success_header_only` exists specifically so a zero-copy `READ`
+    /// can report a total reply length that includes a payload it wrote
+    /// directly into guest memory itself, separately from this header --
+    /// so its one job is producing exactly the same bytes `reply` would
+    /// for an empty-body success, except with `len` reflecting the
+    /// *real* total rather than just this header's own 16 bytes.
+    #[test]
+    fn success_header_only_matches_reply_except_for_len() {
+        let via_reply = OutHeader::reply(0xabcd, 0, &[]);
+        let via_header_only = OutHeader::success_header_only(0xabcd, 16 + 4096);
+
+        assert_eq!(via_reply.len(), OUT_HEADER_LEN);
+        assert_eq!(via_header_only.len(), OUT_HEADER_LEN);
+
+        // Same unique/error encoding...
+        assert_eq!(via_reply[4..], via_header_only[4..]);
+        // ...but `len` reflects the caller-supplied total, not
+        // `OUT_HEADER_LEN + 0`.
+        let len = u32::from_le_bytes(via_header_only[0..4].try_into().unwrap());
+        assert_eq!(len, 16 + 4096);
     }
 }

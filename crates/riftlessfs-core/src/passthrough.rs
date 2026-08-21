@@ -399,6 +399,55 @@ impl PassthroughFs {
         })
     }
 
+    /// Vectored read directly into `iov`, avoiding the caller needing to
+    /// allocate and later copy out of an intermediate buffer -- used by
+    /// the transport layer to `preadv()` straight into guest memory (see
+    /// `riftlessfs-proto`'s `Server::process_vring`), instead of reading
+    /// into a `Vec<u8>` that then gets copied into the guest's buffers
+    /// separately. Behaves like [`read`](Self::read) otherwise (same
+    /// handle lookup, same errno mapping); it's the caller's
+    /// responsibility to ensure the `iovec`s themselves point at valid,
+    /// writable memory for at least their stated length (see
+    /// `Virtqueue::iovecs_from`'s safety notes).
+    pub fn read_vectored(&self, handle: u64, offset: u64, iov: &[libc::iovec]) -> FsResult<usize> {
+        self.handles.with_file(handle, |fd| {
+            let rc = unsafe {
+                libc::preadv(
+                    fd.as_raw_fd(),
+                    iov.as_ptr(),
+                    iov.len() as libc::c_int,
+                    offset as libc::off_t,
+                )
+            };
+            if rc < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(rc as usize)
+        })
+    }
+
+    /// Vectored write directly from `iov`, avoiding the caller needing
+    /// to gather guest memory into an intermediate buffer first -- see
+    /// [`read_vectored`](Self::read_vectored)'s doc comment for the
+    /// full rationale (same idea, opposite direction: `pwritev()`
+    /// straight from guest memory).
+    pub fn write_vectored(&self, handle: u64, offset: u64, iov: &[libc::iovec]) -> FsResult<usize> {
+        self.handles.with_file(handle, |fd| {
+            let rc = unsafe {
+                libc::pwritev(
+                    fd.as_raw_fd(),
+                    iov.as_ptr(),
+                    iov.len() as libc::c_int,
+                    offset as libc::off_t,
+                )
+            };
+            if rc < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(rc as usize)
+        })
+    }
+
     pub fn fsync(&self, handle: u64) -> FsResult<()> {
         self.handles.with_file(handle, |fd| {
             check_errno(unsafe { libc::fsync(fd.as_raw_fd()) })

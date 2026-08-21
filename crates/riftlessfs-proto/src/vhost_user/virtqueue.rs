@@ -191,6 +191,95 @@ impl Virtqueue {
         Ok(written)
     }
 
+    /// Concatenate a chain's readable segments into one buffer, but stop
+    /// after collecting `max_len` bytes (or all segments are exhausted,
+    /// if fewer). Used to cheaply parse a fixed-size request header
+    /// without copying a potentially large payload that follows it in
+    /// the same chain -- see `Server::process_vring`'s zero-copy
+    /// `READ`/`WRITE` handling, which uses this to read just enough of
+    /// a `WRITE` request to parse `fuse_in_header` + `fuse_write_in`
+    /// (a fixed 80 bytes) before switching to [`iovecs_from`] for the
+    /// actual (potentially up-to-1-MiB) payload.
+    pub fn gather_readable_prefix(
+        &self,
+        mem: &GuestMemory,
+        chain: &DescChain,
+        max_len: usize,
+    ) -> Result<Vec<u8>> {
+        let mut buf = Vec::with_capacity(max_len);
+        for &(addr, len) in &chain.readable {
+            if buf.len() >= max_len {
+                break;
+            }
+            let want = (max_len - buf.len()).min(len as usize) as u64;
+            buf.extend_from_slice(
+                mem.get_slice(AddrSpace::Gpa, addr, want)
+                    .ok_or(VirtqueueError::OutOfBounds)?,
+            );
+        }
+        Ok(buf)
+    }
+
+    /// Build `iovec`s pointing directly into guest memory for `segments`
+    /// (a chain's `readable` or `writable` list), skipping the first
+    /// `skip` bytes and including at most `max_total` bytes after that --
+    /// for use with vectored I/O syscalls (`preadv`/`pwritev`) straight
+    /// against guest memory, avoiding the copy-through-`Vec<u8>` that
+    /// [`gather_readable`](Self::gather_readable)/
+    /// [`scatter_writable`](Self::scatter_writable) do. `skip` is how a
+    /// caller addresses a payload that follows a fixed-size header
+    /// within the same chain (see [`gather_readable_prefix`]); `mutable`
+    /// selects [`GuestMemory::get_slice_mut`] (needed for `preadv`,
+    /// which writes into guest memory) vs. `get_slice` (needed for
+    /// `pwritev`, which only reads it).
+    ///
+    /// # Safety / lifetime note
+    /// The returned `iovec`s contain raw pointers into `mem`'s mapped
+    /// regions, which the type system doesn't tie back to `mem`'s
+    /// lifetime (a plain `libc::iovec` has no lifetime of its own).
+    /// They're only valid as long as the underlying mapping is alive
+    /// *and* not concurrently freed/remapped -- callers must use them
+    /// immediately (pass them straight to a syscall in the same
+    /// scope) rather than storing them.
+    pub fn iovecs_from(
+        mem: &GuestMemory,
+        segments: &[(u64, u64)],
+        mut skip: u64,
+        max_total: u64,
+        mutable: bool,
+    ) -> Result<Vec<libc::iovec>> {
+        let mut iovecs = Vec::with_capacity(segments.len());
+        let mut remaining = max_total;
+        for &(addr, len) in segments {
+            if remaining == 0 {
+                break;
+            }
+            if skip >= len {
+                skip -= len;
+                continue;
+            }
+            let start = addr + skip;
+            let seg_len = (len - skip).min(remaining);
+            skip = 0;
+            remaining -= seg_len;
+
+            let iov_base = if mutable {
+                mem.get_slice_mut(AddrSpace::Gpa, start, seg_len)
+                    .ok_or(VirtqueueError::OutOfBounds)?
+                    .as_mut_ptr()
+            } else {
+                mem.get_slice(AddrSpace::Gpa, start, seg_len)
+                    .ok_or(VirtqueueError::OutOfBounds)?
+                    .as_ptr() as *mut u8
+            };
+            iovecs.push(libc::iovec {
+                iov_base: iov_base as *mut libc::c_void,
+                iov_len: seg_len as usize,
+            });
+        }
+        Ok(iovecs)
+    }
+
     /// Publish a completed chain on the used ring and advance its index.
     /// The used ring's own location is a vring data structure (a "user
     /// address"), same as the avail ring and descriptor table.
@@ -368,5 +457,180 @@ mod tests {
             vq.read_chain(&mem, head),
             Err(VirtqueueError::IndirectUnsupported)
         ));
+    }
+
+    /// Set up a 3-descriptor readable chain ("foo"|"bar"|"baz", 3 bytes
+    /// each -- 9 bytes total) shared by the `gather_readable_prefix`/
+    /// `iovecs_from` tests below, which all need to exercise behavior at
+    /// segment boundaries.
+    fn three_segment_readable_chain(mem: &GuestMemory, vq: &Virtqueue) -> DescChain {
+        let a = vq.used_addr + 4096;
+        let b = a + 64;
+        let c = b + 64;
+        write_desc(mem, vq, 0, a, 3, VIRTQ_DESC_F_NEXT, 1);
+        write_desc(mem, vq, 1, b, 3, VIRTQ_DESC_F_NEXT, 2);
+        write_desc(mem, vq, 2, c, 3, 0, 0);
+        mem.get_slice_mut(AddrSpace::Gpa, a, 3)
+            .unwrap()
+            .copy_from_slice(b"foo");
+        mem.get_slice_mut(AddrSpace::Gpa, b, 3)
+            .unwrap()
+            .copy_from_slice(b"bar");
+        mem.get_slice_mut(AddrSpace::Gpa, c, 3)
+            .unwrap()
+            .copy_from_slice(b"baz");
+        DescChain {
+            head: 0,
+            readable: vec![(a, 3), (b, 3), (c, 3)],
+            writable: vec![],
+        }
+    }
+
+    /// Read an `iovec` list's contents back into a single `Vec<u8>`, for
+    /// asserting on -- mirrors what a real `preadv`/`pwritev` caller
+    /// would see, without needing an actual syscall in these tests.
+    unsafe fn iovecs_to_vec(iov: &[libc::iovec]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for v in iov {
+            out.extend_from_slice(std::slice::from_raw_parts(
+                v.iov_base as *const u8,
+                v.iov_len,
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn gather_readable_prefix_stops_at_max_len_across_segments() {
+        let (mem, vq) = test_queue(8);
+        let chain = three_segment_readable_chain(&mem, &vq);
+
+        assert_eq!(vq.gather_readable_prefix(&mem, &chain, 0).unwrap(), b"");
+        assert_eq!(vq.gather_readable_prefix(&mem, &chain, 2).unwrap(), b"fo");
+        // Exactly one full segment.
+        assert_eq!(vq.gather_readable_prefix(&mem, &chain, 3).unwrap(), b"foo");
+        // Spans into the second segment.
+        assert_eq!(
+            vq.gather_readable_prefix(&mem, &chain, 5).unwrap(),
+            b"fooba"
+        );
+        // More than the whole chain: just returns everything there is,
+        // same as `gather_readable`.
+        assert_eq!(
+            vq.gather_readable_prefix(&mem, &chain, 100).unwrap(),
+            b"foobarbaz"
+        );
+    }
+
+    #[test]
+    fn iovecs_from_with_no_skip_covers_all_segments() {
+        let (mem, vq) = test_queue(8);
+        let chain = three_segment_readable_chain(&mem, &vq);
+        let iov = Virtqueue::iovecs_from(&mem, &chain.readable, 0, 9, false).unwrap();
+        assert_eq!(iov.len(), 3);
+        assert_eq!(unsafe { iovecs_to_vec(&iov) }, b"foobarbaz");
+    }
+
+    #[test]
+    fn iovecs_from_skip_within_first_segment() {
+        let (mem, vq) = test_queue(8);
+        let chain = three_segment_readable_chain(&mem, &vq);
+        // Skip 1 byte into "foo" -> first iovec should start at "oo",
+        // not skip the whole first descriptor.
+        let iov = Virtqueue::iovecs_from(&mem, &chain.readable, 1, 8, false).unwrap();
+        assert_eq!(unsafe { iovecs_to_vec(&iov) }, b"oobarbaz");
+    }
+
+    #[test]
+    fn iovecs_from_skip_exactly_one_full_segment() {
+        let (mem, vq) = test_queue(8);
+        let chain = three_segment_readable_chain(&mem, &vq);
+        // Skip exactly the first 3-byte segment -- this is the case
+        // that matters most in practice, since a `WRITE` request's
+        // fixed 80-byte header almost always lands on a descriptor
+        // boundary (the guest driver puts it in its own descriptor).
+        let iov = Virtqueue::iovecs_from(&mem, &chain.readable, 3, 6, false).unwrap();
+        assert_eq!(
+            iov.len(),
+            2,
+            "shouldn't emit an empty iovec for the fully-skipped segment"
+        );
+        assert_eq!(unsafe { iovecs_to_vec(&iov) }, b"barbaz");
+    }
+
+    #[test]
+    fn iovecs_from_skip_spanning_multiple_segments() {
+        let (mem, vq) = test_queue(8);
+        let chain = three_segment_readable_chain(&mem, &vq);
+        // Skip past all of "foo" and into "bar".
+        let iov = Virtqueue::iovecs_from(&mem, &chain.readable, 4, 5, false).unwrap();
+        assert_eq!(unsafe { iovecs_to_vec(&iov) }, b"arbaz");
+    }
+
+    #[test]
+    fn iovecs_from_max_total_truncates_mid_segment() {
+        let (mem, vq) = test_queue(8);
+        let chain = three_segment_readable_chain(&mem, &vq);
+        // No skip, but cap total at 4 bytes -- should truncate partway
+        // through the second segment, not just stop after whole segments.
+        let iov = Virtqueue::iovecs_from(&mem, &chain.readable, 0, 4, false).unwrap();
+        assert_eq!(unsafe { iovecs_to_vec(&iov) }, b"foob");
+    }
+
+    #[test]
+    fn iovecs_from_skip_and_max_total_combined() {
+        let (mem, vq) = test_queue(8);
+        let chain = three_segment_readable_chain(&mem, &vq);
+        // Skip the first segment entirely, then cap at 2 bytes into the
+        // remainder -- exercises both boundaries at once.
+        let iov = Virtqueue::iovecs_from(&mem, &chain.readable, 3, 2, false).unwrap();
+        assert_eq!(unsafe { iovecs_to_vec(&iov) }, b"ba");
+    }
+
+    #[test]
+    fn iovecs_from_skip_past_everything_yields_empty() {
+        let (mem, vq) = test_queue(8);
+        let chain = three_segment_readable_chain(&mem, &vq);
+        let iov = Virtqueue::iovecs_from(&mem, &chain.readable, 9, 100, false).unwrap();
+        assert!(iov.is_empty());
+    }
+
+    #[test]
+    fn iovecs_from_mutable_writes_through_to_guest_memory() {
+        let (mem, mut vq) = test_queue(8);
+        let a = vq.used_addr + 4096;
+        let b = a + 64;
+        write_desc(
+            &mem,
+            &vq,
+            0,
+            a,
+            4,
+            VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+            1,
+        );
+        write_desc(&mem, &vq, 1, b, 4, VIRTQ_DESC_F_WRITE, 0);
+        publish_avail(&mem, &vq, 0, 0, 1);
+        let head = vq.pop_avail(&mem).unwrap().unwrap();
+        let chain = vq.read_chain(&mem, head).unwrap();
+        assert_eq!(chain.writable, vec![(a, 4), (b, 4)]);
+
+        // Skip 2 bytes into the (8-byte-total) writable area and write
+        // through the returned iovecs, as the zero-copy READ path does
+        // after reserving room for a `fuse_out_header`.
+        let iov = Virtqueue::iovecs_from(&mem, &chain.writable, 2, 6, true).unwrap();
+        let mut offset = 0usize;
+        for v in &iov {
+            let slice = unsafe { std::slice::from_raw_parts_mut(v.iov_base as *mut u8, v.iov_len) };
+            slice.fill(b'X');
+            offset += slice.len();
+        }
+        assert_eq!(offset, 6);
+
+        // First 2 bytes of the writable area untouched, next 6 are 'X'.
+        let whole_a = mem.get_slice(AddrSpace::Gpa, a, 4).unwrap();
+        let whole_b = mem.get_slice(AddrSpace::Gpa, b, 4).unwrap();
+        assert_eq!(whole_a, [0, 0, b'X', b'X']);
+        assert_eq!(whole_b, [b'X', b'X', b'X', b'X']);
     }
 }

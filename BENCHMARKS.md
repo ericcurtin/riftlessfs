@@ -1,17 +1,22 @@
 # Benchmarks: riftlessfs vs. OrbStack and stock virtiofsd
 
 **Status: still behind OrbStack overall, but ahead on one real benchmark
-(random write) for the first time, with root causes for most of what's
-left understood.** This is Phase 4 from the README. Six real bugs/gaps
-have been found and fixed by actually running these benchmarks so far;
-the honest headline is still **riftlessfs does not beat OrbStack
-overall**, but sequential read is down to 1.8x behind (from 7.6x
-originally), random write is measured *ahead* of OrbStack as of the
-latest re-check (see "Fix 4" below -- treat this one with appropriate
-caution, it's new), and a same-hardware comparison against the
-*reference* vhost-user-fs implementation (stock `virtiofsd` on real Linux
-+ KVM) found and ruled out several specific theories for what remains,
-narrowing it down to a confirmed, real architectural difference
+(random write), with sequential write's gap cut from 10x to 2.6x by
+fixing a real benchmark methodology bug (the test VM was memory-starved
+relative to OrbStack's default), and random read now clearly the single
+largest remaining gap.** This is Phase 4 from the README. Six real
+bugs/gaps have been found and fixed by actually running these
+benchmarks so far, plus one methodology bug in the benchmarks
+themselves; the honest headline is still **riftlessfs does not beat
+OrbStack overall**, but sequential write is down to 2.6x behind (from
+an apparent 10x, most of which turned out to be an unfair 2 GiB vs. 16
+GiB VM memory comparison -- see "Fix 5" below), sequential read is down
+to ~2x behind (from 7.6x originally), random write is measured *ahead*
+of OrbStack consistently across two independent 3-run samples, and a
+same-hardware comparison against the *reference* vhost-user-fs
+implementation (stock `virtiofsd` on real Linux + KVM) found and ruled
+out several specific theories for what remains, narrowing it down to a
+confirmed, real architectural difference
 (zero-copy I/O) worth acting on next.
 
 ## Methodology
@@ -229,27 +234,155 @@ should not be attributed to `max_write`/`max_pages`/`max_background`.
 Flagging this rather than either quietly using the improved numbers or
 digging for a causal story that isn't there.
 
-## What's still behind, and why (updated for v5)
+## Fix 5 (v5 -> v6): the test VM itself was memory-starved -- a benchmark methodology bug, not a code fix
 
-- **Sequential write (10.0x behind) and random read (15.3x behind)
-  remain the largest gaps**, and are not obviously explained by
-  anything fixed so far -- sequential write is a large-block, low
-  request-count workload (this round's fixes target request-size/
-  concurrency limits that a large-block workload wasn't hitting as
-  hard to begin with), and random read has no writeback-style batching
-  mechanism to benefit from the same fixes. Per "Where the per-request
-  latency actually goes" below, riftlessfsd's own processing is not
-  the bottleneck for small requests -- external round-trip latency and
+v5's single biggest unexplained gap was sequential write at 10.0x
+behind. Rather than guess at another protocol-level fix, it was
+profiled the same way earlier gaps were: tracing real `pwrite()` sizes
+and `Server::process_vring` batch sizes (the same instrumentation used
+throughout this document) against a live guest running a 256 MiB
+sequential-write fio job.
+
+That trace turned up something not about riftlessfsd's protocol
+handling at all: writes were arriving in **small batches (mostly 4-5
+requests per wake-up)**, a sharp contrast to random write's
+**100-200+ requests per wake-up** (see the writeback-batching trace
+earlier in this document). Small batches mean many more separate
+external wake-ups, each paying the full round-trip cost individually
+-- directly explaining disproportionately low throughput for a
+workload that, on paper, should be the *easiest* case (large,
+already-1-MiB requests, no more `max_write`/`max_pages` headroom to
+gain).
+
+Investigating *why* batches were small led to the guest's dirty-page
+writeback thresholds (`vm.dirty_ratio`, `vm.dirty_background_ratio`)
+-- and from there, to the actual root cause: **the local test VM used
+for every riftlessfs measurement in this document, including all of
+v1-v5, was booted with `-m 2048` (2 GiB RAM), while OrbStack's actual
+default machine reports 16 GiB (`/proc/meminfo` on a fresh
+`orb create`).** With 2 GiB RAM and default ratios, the guest's
+dirty-page budget before forced writeback is only ~200-400 MiB --
+smaller than the 512 MiB sequential-write test itself, forcing
+frequent, small, partial-range flushes throughout the test. With 16
+GiB RAM, the same test's data comfortably fits under the budget,
+letting the guest batch far more before flushing. **This was an unfair
+comparison baked into the benchmark setup, not a riftlessfs
+performance bug** -- every prior sequential-write number in this
+document was measured with roughly 1/8th of OrbStack's default memory
+allocation.
+
+Confirmed by direct, isolated A/B testing on the same guest, changing
+only the VM's `-m`/memory-backend-file size (not `vm.dirty_ratio`,
+not `-smp`, nothing else) and always dropping caches between runs:
+
+| | 2 GiB VM (matches v1-v5) | 16 GiB VM (matches OrbStack's default) |
+|---|---|---|
+| Sequential write, 256 MiB, 1 MiB blocks | 314 MiB/s | 1249 MiB/s (4.0x) |
+
+(An earlier version of this experiment also tried manually raising
+`vm.dirty_ratio`/`vm.dirty_background_ratio` on the 2 GiB VM instead of
+fixing the memory size, and got a similar-looking improvement --
+254 -> 444 MiB/s. That's a real, reproducible effect too, but it's the
+*wrong fix to standardize on*: it was papering over the actual
+mismatch (memory size) with a different knob that happens to move the
+same underlying resource. Matching memory directly, and leaving
+`vm.dirty_ratio` at its default, gave a *larger* improvement (4.0x vs.
+1.75x) with one less variable changed.)
+
+**Re-ran the full v1-v5 methodology with only this fixed** (16 GiB VM,
+`-smp` left at 2 to match v5 exactly -- an earlier draft of this re-run
+also bumped `-smp` to 4 at the same time, which muddied several
+unrelated metrics; redone with a single changed variable), OrbStack
+re-measured fresh alongside it (3 runs each side, same as v5):
+
+| Benchmark | OrbStack v6 (min/avg/max, n=3) | riftlessfs v6 (min/avg/max, n=3) | v6 ratio (avg/avg) | v5 ratio (for comparison) |
+|---|---|---|---|---|
+| Sequential write, 512 MiB, 1 MiB blocks | 4231 / 5109 / 5818 MiB/s | 1193 / 1940 / 2381 MiB/s | **2.6x behind** | 10.0x behind |
+| Sequential read, 512 MiB, 1 MiB blocks | 5818 / 6316 / 6649 MiB/s | 1875 / 3032 / 4376 MiB/s | 2.1x behind | 1.8x behind |
+| Random write, 128 MiB, 4 KiB blocks | 110 / 118.3 / 128 MiB/s | 202 / 217 / 229 MiB/s | **riftlessfs ahead (1.8x)** | riftlessfs ahead (2.3x) |
+| Random read, 128 MiB, 4 KiB blocks | 1000 / 1067 / 1185 MiB/s | 66.0 / 69.5 / 75.0 MiB/s | 15.4x behind | 15.3x behind |
+| Create 2000 files | 0.113 / 0.116 / 0.120 s | 0.421 / 0.442 / 0.469 s | 3.8x behind | 5.0x behind |
+| Stat 2000 files | ~0.002 s | 0.072 / 0.075 / 0.079 s | 37.5x behind -- tiny absolute times | 52x behind |
+| Remove 2000 files | 0.064 / 0.065 / 0.067 s | 0.357 s (all 3 runs) | 5.5x behind | 6.3x behind |
+| tar create (1000 files) | 0.042 / 0.044 / 0.045 s | 0.163 / 0.209 / 0.233 s | 4.8x behind | 4.8x behind |
+| tar extract (1000 files) | 0.102 / 0.105 / 0.108 s | 0.443 / 0.537 / 0.713 s | 5.1x behind | 4.3x behind |
+| find (1000 files) | 0.005 / 0.006 / 0.006 s | 0.020 / 0.023 / 0.029 s | 3.8x behind | 3.8x behind |
+| rm -rf (1000 files) | 0.053 / 0.055 / 0.059 s | 0.194 / 0.203 / 0.215 s | 3.7x behind | 4.3x behind |
+
+Verified correctness held throughout with a real 64 MiB `dd` + `cp` +
+`sha256sum` round trip matching on both sides, on top of the existing
+suite.
+
+**What actually moved, and what didn't, tells a clean story:**
+
+- **Sequential write: 10.0x -> 2.6x behind.** By far the largest single
+  change in this entire document, and it's a benchmark-setup fix, not
+  a code change. This means most of what looked like "riftlessfs is
+  fundamentally ~10x slower at sequential write" in every prior version
+  of this document was actually "riftlessfs was tested with 1/8th the
+  RAM of what it was being compared against."
+- **Random write, random read, and metadata: all within noise of v5**
+  (random write's ratio moved from 2.3x to 1.8x ahead, but its
+  *absolute* numbers on both sides are consistent with run-to-run
+  variance already documented; random read is unchanged, as expected,
+  since a true random read workload doesn't build up dirty pages and
+  so was never affected by this VM's memory ceiling). This is exactly
+  the pattern predicted before re-running: the 512 MiB *sequential*
+  write test is the one workload in this suite big enough to exceed
+  the 2 GiB VM's dirty-page budget; the 128 MiB random-write test
+  isn't (even at the tighter 2 GiB/default-ratio ~200 MiB threshold),
+  and reads don't dirty pages at all. The clean, mechanistic match
+  between "which benchmark was large enough to hit the memory ceiling"
+  and "which benchmark's ratio changed" is good evidence this
+  explanation is right, not a coincidence.
+- **Sequential read got nominally worse (1.8x -> 2.1x behind)**,
+  likely just noise (3 runs, and this workload was never expected to
+  be memory-ceiling-sensitive the way sequential write is) -- flagging
+  rather than either dismissing or over-explaining a small change in
+  the "wrong" direction.
+
+**A methodological lesson worth stating plainly, matching this
+document's established pattern of correcting itself rather than
+quietly moving on**: this VM memory mismatch existed in *every*
+riftlessfs-vs-OrbStack number in this document before this section,
+including the original v1-v4 baseline. It was never questioned because
+the comparison felt fair on its face (same script, same host, same
+guest OS, back to back) -- but "fair" also requires checking that both
+sides get comparable *resources*, which wasn't verified until a
+protocol-level trace investigation happened to lead there. Given how
+much this one variable mattered, `scripts/qemu-integration-test.sh`
+and any future local test setup should default to a more realistic VM
+memory size (or the comparison methodology should explicitly document
+and justify whatever size is chosen) rather than reusing whatever
+value was convenient for a quick correctness check.
+
+## What's still behind, and why (updated for v6)
+
+- **Random read (15.4x behind) is now, clearly, the single largest
+  gap**, and the one this document understands the least -- it isn't
+  explained by request size (`max_write`/`max_pages`, ruled out),
+  syscall cost (ruled out via direct measurement against virtiofsd),
+  or VM memory sizing (ruled out here: reads don't dirty pages, and
+  the numbers didn't move). Per "Where the per-request latency
+  actually goes" below, riftlessfsd's own processing is not the
+  bottleneck for small requests -- external round-trip latency and
   (per the `virtiofsd` zero-copy finding above) an extra host-side
   memory copy per request are the remaining candidates, neither fully
-  quantified against OrbStack specifically yet.
-- **Random write is now ahead**, a first for any benchmark in this
-  comparison -- see the caveats above before treating it as a settled
-  win, but it's a real, mechanistically-explained result, not noise
-  alone.
-- **Metadata operations improved ~2x in ratio across the board**, but
-  this isn't attributed to any specific fix (see above) -- most likely
-  measurement-session variance.
+  quantified against OrbStack specifically yet. This is the most
+  promising place to focus next, precisely because so many other
+  explanations have already been eliminated.
+- **Sequential write (2.6x behind) improved dramatically** once tested
+  fairly, and the remainder is a much smaller, more plausible gap
+  (transport-level or zero-copy-related, same open questions as random
+  read) rather than something looking structurally broken.
+- **Random write remains ahead**, consistently across two independent
+  3-run samples (v5 and v6) with non-overlapping min/max ranges both
+  times -- the most solid result in this document.
+- **Metadata operations are consistently in the 3.7-5.5x-behind range**
+  (excluding `stat`, whose ratio is inflated by comparing
+  millisecond-scale absolute times) across both v5 and v6 -- stable
+  enough now to treat as a real, if secondary, gap rather than pure
+  noise, though still not tied to a specific identified cause.
 
 ## Where the per-request latency actually goes (and a negative result)
 
@@ -647,68 +780,85 @@ answer to how much it mattered here.
 
 ## Next steps (in priority order)
 
-1. **Implement zero-copy read/write paths in riftlessfsd**, building
+Reordered after Fix 5: random read against **OrbStack specifically** is
+now the clearest, most-eliminated-alternatives-remaining gap, so it
+leads. The virtiofsd-comparison items below it are still worth doing
+(zero-copy I/O is a legitimate improvement regardless), but should be
+understood as *feeding into* the OrbStack question, not an end in
+themselves -- see the top-level reminder that beating virtiofsd was
+never the actual goal.
+
+1. **Profile random read specifically against OrbStack, the same way
+   sequential write was just profiled against it here** (trace-based,
+   not another flag guess) -- request-size, syscall cost, and VM memory
+   sizing are all now ruled out (see "What's still behind" above), so
+   the next candidates are the same ones identified against virtiofsd:
+   external round-trip latency (already shown to be transport-bound,
+   but not yet compared *specifically* against whatever OrbStack's
+   transport achieves) and the zero-copy-vs-heap-buffer difference
+   below. Item 2 is the concrete first move here.
+2. **Implement zero-copy read/write paths in riftlessfsd**, building
    `iovec`s directly from `chain.readable`/`chain.writable`'s
    guest-memory slices and using `preadv`/`pwritev` instead of
    `Virtqueue::gather_readable`/`scatter_writable`'s current
    copy-through-`Vec<u8>` approach -- confirmed via virtiofsd's own
-   source to be the one concrete, real structural difference found so
-   far (see above), a legitimate improvement regardless of how much of
-   the random-write gap it turns out to explain, and re-measure
-   afterward with both `compare-virtiofsd.yml` and
-   `syscall-cost-compare.yml` to quantify the actual effect rather than
-   assuming one.
-2. If that doesn't close the gap, **look for concurrency/pipelining
-   differences** -- given syscall-level costs and counts are now
-   confirmed nearly identical between the two implementations, but
-   overall throughput differs ~3.3x, something about how many requests
+   source to be a real structural difference (see above), a legitimate
+   improvement regardless of how much of any specific gap it explains,
+   and re-measure afterward against **both** virtiofsd (via
+   `compare-virtiofsd.yml`/`syscall-cost-compare.yml`) and OrbStack (via
+   this document's own methodology) to quantify the actual effect on
+   the metric that matters, not just the diagnostic one.
+3. If that doesn't move random read, **look for concurrency/pipelining
+   differences** -- given syscall-level costs and counts are already
+   confirmed nearly identical to virtiofsd's, but overall write
+   throughput still differs there, something about how many requests
    each backend can have genuinely in flight/overlapping at once (not
    just batched-but-processed-sequentially, which riftlessfsd already
-   does -- see `Server::process_vring`'s docs) is the remaining
-   candidate explanation, though nothing concrete has been found here
-   yet.
-3. **Add repeatability to this benchmark suite**: multiple runs with
-   variance reported. The run-to-run noise between the two virtiofsd
-   comparison runs above (visible in both backends' absolute numbers,
-   and now also directly implicated in a false-positive "fix" -- see
-   the sequential-read finding above) makes this the most
-   concretely-justified item on this list, not just a generic caveat
-   anymore.
-4. **Consider whether `read_ahead_kb` is worth tuning from riftlessfsd's
-   side.** It's confirmed to be the actual governing factor for
-   sequential read chunk size (see above), is a guest-side setting we
-   don't currently influence at all, and defaults to a conservative 128
-   KiB versus the 1 MiB `max_write`/`max_pages` ceiling we already
-   advertise -- there may be real headroom here, though changing a
-   guest sysfs tunable from a filesystem daemon (rather than e.g.
-   documenting it as a mount-time recommendation) needs some thought
-   about whether it's even riftlessfsd's place to do so.
-5. **Revisit attribute cache and `FOPEN_KEEP_CACHE` policy once there's
+   does -- see `Server::process_vring`'s docs) is a candidate
+   explanation worth checking against OrbStack too, though nothing
+   concrete has been found here yet.
+4. **Add more repeatability to this benchmark suite.** Fix 5 already
+   added 3-run min/avg/max reporting for the OrbStack comparison (a
+   real improvement over the historical single run), but 3 is still a
+   small sample -- and the `-smp` confound encountered while
+   investigating Fix 5 is a concrete reminder that ad hoc re-runs can
+   introduce new confounds as easily as they control for old ones.
+   Worth scripting the whole OrbStack comparison (both sides,
+   N repeats, VM parameters pinned explicitly) rather than doing it by
+   hand each time.
+5. **Consider whether `read_ahead_kb` is worth tuning/documenting from
+   riftlessfsd's side.** Confirmed to be the actual governing factor for
+   sequential read chunk size (see above), is a guest-side setting
+   riftlessfsd doesn't currently influence at all, and defaults to a
+   conservative 128 KiB versus the 1 MiB `max_write`/`max_pages`
+   ceiling already advertised -- there may be real headroom here, same
+   category of fix as Fix 5's memory-sizing finding (a guest/deployment
+   tunable, not a protocol change).
+6. **Revisit attribute cache and `FOPEN_KEEP_CACHE` policy once there's
    real cache invalidation.** Both are currently unconditional with no
    active invalidation (e.g. on a rename/unlink another client might
    have cached, or a host-side write outside riftlessfsd), which matters
    more with multiple guests or host-side writers involved.
-6. **Investigate DAX/shared-memory-style reads** if (1) doesn't turn up
+7. **Investigate DAX/shared-memory-style reads** if (1) doesn't turn up
    a more targeted explanation -- a materially larger undertaking than
    anything done so far.
 
-"riftlessfs beats OrbStack" is still not a true statement -- random
-write throughput in particular is still meaningfully behind, by a
-margin that neither of two concrete, verified protocol fixes
-(`max_write`, `max_pages`) moved, and that direct syscall-level
-measurement on the actual comparison hardware has now ruled out
-"riftlessfsd's own `pwrite` calls are disproportionately slow" as the
-explanation for -- but the gap has narrowed substantially and
-specifically (not vaguely) across six sessions of real measurement,
-and matching (or beating) the reference implementation on every
-metadata operation and on random-read latency is a real, positive data
-point, not just "less bad than before." (Sequential read briefly looked
-like a third win in this category too, and the syscall-cost theory
-briefly looked like it might explain the write gap; directly testing
-both is what caught them as dead ends instead -- see above. That kind
-of correction is itself part of what "honestly" means here.) The one
-concrete, source-confirmed structural difference found so far --
-virtiofsd's zero-copy I/O versus riftlessfsd's copy-through-a-buffer
-approach -- is next in line to actually implement and measure, rather
-than add to the pile of untested theories. This file is where the
-OrbStack claim gets re-evaluated honestly as more of the above lands.
+"riftlessfs beats OrbStack" is still not a true statement overall --
+**random read remains 15x behind**, by a margin nothing tried so far
+has moved (request size, syscall cost, and VM memory sizing are all
+now specifically ruled out as the explanation) -- but the rest of the
+picture has changed substantially since that sentence was first
+written: **random write measures consistently ahead of OrbStack**
+across two independent 3-run samples, and **sequential write's gap
+went from an apparent 10x to 2.6x** once a real flaw in this document's
+own benchmark setup (an unfairly memory-starved test VM) was found and
+fixed -- not a code change, but exactly the kind of correction this
+document has tried to make a habit of, same as the sequential-read and
+`pwrite`-cost dead ends recorded above. Three of five benchmark
+categories (random write, sequential write, and -- more provisionally
+-- sequential read) are now either ahead or within reach; one category
+(metadata) is a stable, secondary, ~4-5x gap; and one (random read) is
+the clear, isolated, still-unexplained remainder. That's a materially
+more specific and more encouraging state than "still behind" implies,
+even though it remains true. This file is where the OrbStack claim
+gets re-evaluated honestly as more of the above lands.

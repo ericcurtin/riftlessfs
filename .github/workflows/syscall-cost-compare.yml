@@ -1,0 +1,54 @@
+name: Compare syscall cost vs stock virtiofsd
+
+# Manually triggered, not run on every push: narrow diagnostic companion
+# to compare-virtiofsd.yml, wrapping both daemons in strace to compare
+# their own pwrite()/pread() syscall timing directly, on the actual
+# comparison hardware. See BENCHMARKS.md's random-write investigation
+# and scripts/syscall-cost-compare.sh.
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  compare:
+    name: syscall-cost-compare (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install QEMU + UEFI firmware + virtiofsd + strace
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-system-arm ovmf qemu-efi-aarch64 genisoimage virtiofsd strace
+      - name: Check for usable KVM
+        id: kvm
+        run: |
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+            echo "has_kvm=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "/dev/kvm not present on this runner; this comparison isn't meaningful under TCG, skipping"
+            echo "has_kvm=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Cache Fedora cloud image
+        if: steps.kvm.outputs.has_kvm == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/riftlessfs-qemu-test
+          key: fedora-cloud-44-${{ matrix.name }}
+      - name: Run comparison
+        if: steps.kvm.outputs.has_kvm == 'true'
+        run: ./scripts/syscall-cost-compare.sh

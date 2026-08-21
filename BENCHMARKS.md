@@ -332,19 +332,68 @@ alone. Added `init_out_advertises_max_pages_matching_max_write` (in
 `fuse::wire`) as a regression test so this can't silently regress again.
 CI (fmt/build/test/clippy) verified green and a real 64 MiB
 copy-and-`sha256sum` round trip through the local QEMU guest still
-matches after the change. A fresh `compare-virtiofsd.yml` run is needed
-to get the real before/after numbers on the actual comparison hardware
--- local (macOS/HVF) throughput numbers were too noisy run-to-run to be
-worth reporting here directly, but the *mechanism* (syscall size and
-count) was directly observed and isn't in question.
+matches after the change.
+
+**Run 3** (same `compare-virtiofsd.yml`, after the `FUSE_MAX_PAGES`
+fix; `linux-x86_64` -- the `linux-aarch64` leg skipped as usual, no
+`/dev/kvm` on that runner this time):
+
+| Benchmark | riftlessfsd | virtiofsd | riftlessfs vs. virtiofsd |
+|---|---|---|---|
+| Sequential write, 512 MiB, 1 MiB blocks | 401 MiB/s | 861 MiB/s | 2.1x behind (was 2.1x) |
+| Sequential read, 512 MiB, 1 MiB blocks | 1718 MiB/s | 1869 MiB/s | **1.09x behind** (was 3.1x!) |
+| Random write, 128 MiB, 4 KiB blocks | 269 MiB/s (69.0k IOPS) | 895 MiB/s (229k IOPS) | 3.3x behind (was 3.3x) |
+| Random read, 128 MiB, 4 KiB blocks | 88.0 MiB/s (22.5k IOPS) | 73.5 MiB/s (18.8k IOPS) | **riftlessfs ahead** (1.2x) |
+| Create 2000 files | 0.441 s | 0.425 s | ~equal |
+| Stat 2000 files | 0.105 s | 0.069 s | virtiofsd ahead this run |
+| Remove 2000 files | 0.288 s | 0.254 s | virtiofsd ahead this run |
+| tar create (1000 files) | 0.152 s | 0.209 s | riftlessfs ahead |
+| tar extract (1000 files) | 0.459 s | 0.398 s | virtiofsd ahead this run |
+| find (1000 files) | 0.029 s | 0.027 s | ~equal |
+| rm -rf (1000 files) | 0.150 s | 0.155 s | ~equal |
+
+This confirms both predictions from the local trace investigation
+exactly: **random write's ratio is unchanged (3.3x, both before and
+after)** -- as expected, since its `pwrite()` sizes barely moved -- and
+random read remains roughly at parity (still noisy enough run-to-run
+that "riftlessfs ahead" shouldn't be over-read, same caveat as before).
+Metadata ops flipped which side "wins" on several rows compared to Run
+2 (stat, remove, and tar extract all favor virtiofsd here, versus
+riftlessfs in the previous run) -- further, concrete confirmation that
+these small deltas are noise, not real regressions or improvements,
+exactly the caution the "add repeatability" next-step item has been
+flagging.
+
+**Sequential read improving from 3.1x behind to 1.09x behind (near
+parity) is the standout, and a genuine surprise**: this fix was made
+(and reasoned about) entirely in terms of *write* batching, since that's
+where the local trace investigation found the bug (capped `pwrite()`
+sizes). Nothing in that investigation looked at read request sizes at
+all. The most likely explanation is that `max_pages` isn't
+write-specific in the kernel -- it bounds the page count of *any* single
+FUSE request, including how many pages worth of data a readahead-driven
+`READ` request can carry -- so the same 32-pages-by-kernel-default cap
+this fix removes for writes was very plausibly also silently capping
+sequential readahead chunk size to 128 KiB, independent of the
+`max_readahead` value we already pass through unmodified. This is a
+plausible mechanism, not yet directly confirmed the way the write-side
+fix was (by tracing actual `pread()` sizes before and after) -- doing
+that trace is now the highest-value follow-up, since it would either
+confirm this mechanism cleanly or reveal the real read-side improvement
+is coming from something else (e.g. run-to-run noise happening to land
+favorably this time, though a jump this large in one specific,
+mechanistically-plausible direction seems unlikely to be pure noise).
 
 ## Next steps (in priority order)
 
-1. **Run `compare-virtiofsd.yml` again** to get real before/after
-   numbers for the `max_pages` fix above on the actual comparison
-   hardware, particularly whether it moves sequential write further
-   (expected) and confirms random write is unaffected (expected, but
-   should be checked rather than assumed).
+1. **Confirm the sequential-read improvement's mechanism** by tracing
+   actual `pread()` sizes before/after the `max_pages` fix the same way
+   it was done for writes (add the equivalent instrumentation, or reuse
+   the existing `pread(...) took ...` trace already added to
+   `fuse::dispatch::Session::handle`, against a local guest with the
+   previous commit checked out for the "before" side). Turning a
+   plausible mechanism into a confirmed one before relying on it for
+   further decisions.
 2. **Investigate the *random write* gap specifically**, now that two
    independent protocol-level explanations (`max_write`, `max_pages`)
    have been checked and fixed on our side without closing it -- profile
@@ -369,9 +418,11 @@ count) was directly observed and isn't in question.
 
 "riftlessfs beats OrbStack" is still not a true statement -- random write
 throughput in particular is still meaningfully behind, by a margin that
-one concrete fix (`max_write`) did not move -- but the gap has narrowed
-substantially and specifically (not vaguely) across four sessions of
-real measurement, and matching (or beating) the reference implementation
-on every metadata operation and on random-read latency is a real,
-positive data point, not just "less bad than before." This file is where
-the OrbStack claim gets re-evaluated honestly as more of the above lands.
+two concrete, verified protocol fixes (`max_write`, `max_pages`) did not
+move -- but the gap has narrowed substantially and specifically (not
+vaguely) across five sessions of real measurement, and matching (or
+beating) the reference implementation on every metadata operation, on
+random-read latency, and now on sequential-read throughput too is a
+real, positive data point, not just "less bad than before." This file is
+where the OrbStack claim gets re-evaluated honestly as more of the above
+lands.

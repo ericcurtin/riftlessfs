@@ -92,7 +92,7 @@ Given that, the plan is split into phases:
   competitive with stock virtiofsd on several benchmarks):** real,
   head-to-head benchmarks against both OrbStack and the reference
   vhost-user-fs implementation. See [BENCHMARKS.md](BENCHMARKS.md) for
-  full results and analysis. Four real bugs/gaps found and fixed *by*
+  full results and analysis. Six real bugs/gaps found and fixed *by*
   this benchmarking work so far: attribute/entry caching was disabled
   entirely (a synthetic "stat 2000 files" benchmark was ~60x slower than
   it needed to be); `FUSE_WRITEBACK_CACHE` wasn't advertised (every
@@ -111,9 +111,21 @@ Given that, the plan is split into phases:
   a fifth fix: it advertises an 8x larger `max_write` (1 MiB vs.
   riftlessfsd's 128 KiB); matching it closed the sequential-write gap
   from 2.8x to 2.1x behind, but left the random-write gap unchanged
-  (~3.2x) -- proof that request-size mismatch explained the sequential
-  gap but not the random one, which needs its own targeted
-  investigation rather than another flag or constant to tweak.
+  (~3.2x). Tracing actual `pwrite()` sizes reaching the backend then
+  found a sixth, independent bug: every write stayed capped at 128 KiB
+  regardless, because the FUSE ABI's `max_pages` field (not `max_write`)
+  governs writeback batching, and it's silently ignored unless the
+  `FUSE_MAX_PAGES` flag is set -- which riftlessfsd wasn't setting.
+  Fixing that (while leaving `max_write` alone) had a genuine surprise:
+  sequential *read* throughput jumped from 3.1x behind virtiofsd to
+  1.09x (near parity), plausibly because `max_pages` also bounds
+  readahead request size, not just writes -- and, exactly as predicted
+  beforehand from the write-size tracing, random write's ratio didn't
+  move at all (still ~3.3x), since a genuinely random access pattern
+  offers little for writeback to batch regardless of the ceiling. Two
+  fixes down, request-size mismatch is now ruled out twice over as the
+  random-write explanation, which needs its own targeted investigation
+  rather than another flag or constant to tweak.
 
 ## How this was actually verified
 

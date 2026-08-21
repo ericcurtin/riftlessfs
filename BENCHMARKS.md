@@ -341,7 +341,7 @@ fix; `linux-x86_64` -- the `linux-aarch64` leg skipped as usual, no
 | Benchmark | riftlessfsd | virtiofsd | riftlessfs vs. virtiofsd |
 |---|---|---|---|
 | Sequential write, 512 MiB, 1 MiB blocks | 401 MiB/s | 861 MiB/s | 2.1x behind (was 2.1x) |
-| Sequential read, 512 MiB, 1 MiB blocks | 1718 MiB/s | 1869 MiB/s | **1.09x behind** (was 3.1x!) |
+| Sequential read, 512 MiB, 1 MiB blocks | 1718 MiB/s | 1869 MiB/s | 1.09x behind (was 3.1x -- turned out to be noise, not this fix; see below) |
 | Random write, 128 MiB, 4 KiB blocks | 269 MiB/s (69.0k IOPS) | 895 MiB/s (229k IOPS) | 3.3x behind (was 3.3x) |
 | Random read, 128 MiB, 4 KiB blocks | 88.0 MiB/s (22.5k IOPS) | 73.5 MiB/s (18.8k IOPS) | **riftlessfs ahead** (1.2x) |
 | Create 2000 files | 0.441 s | 0.425 s | ~equal |
@@ -365,36 +365,44 @@ exactly the caution the "add repeatability" next-step item has been
 flagging.
 
 **Sequential read improving from 3.1x behind to 1.09x behind (near
-parity) is the standout, and a genuine surprise**: this fix was made
-(and reasoned about) entirely in terms of *write* batching, since that's
-where the local trace investigation found the bug (capped `pwrite()`
-sizes). Nothing in that investigation looked at read request sizes at
-all. The most likely explanation is that `max_pages` isn't
-write-specific in the kernel -- it bounds the page count of *any* single
-FUSE request, including how many pages worth of data a readahead-driven
-`READ` request can carry -- so the same 32-pages-by-kernel-default cap
-this fix removes for writes was very plausibly also silently capping
-sequential readahead chunk size to 128 KiB, independent of the
-`max_readahead` value we already pass through unmodified. This is a
-plausible mechanism, not yet directly confirmed the way the write-side
-fix was (by tracing actual `pread()` sizes before and after) -- doing
-that trace is now the highest-value follow-up, since it would either
-confirm this mechanism cleanly or reveal the real read-side improvement
-is coming from something else (e.g. run-to-run noise happening to land
-favorably this time, though a jump this large in one specific,
-mechanistically-plausible direction seems unlikely to be pure noise).
+parity) looked like a standout result from the `max_pages` fix, but
+directly testing that hypothesis disproved it.** The fix was made (and
+reasoned about) entirely in terms of *write* batching, since that's
+where the trace investigation found the bug (capped `pwrite()` sizes);
+nothing in that investigation had looked at read request sizes at all.
+The plausible-sounding theory was that `max_pages` isn't write-specific
+in the kernel and also bounds readahead request size -- but "plausible"
+isn't "confirmed," so it was tested directly rather than left as a
+guess: built both the pre- and post-fix binaries locally, traced actual
+`pread()` sizes against the same real QEMU/HVF guest with a cold page
+cache (`echo 3 > /proc/sys/vm/drop_caches` before each read) to force
+genuine backend round trips, and compared.
+
+**Result: identical.** Both binaries produced exactly 512 `pread()`
+calls of exactly 131072 bytes (128 KiB) each for the same 64 MiB cold
+sequential read -- `max_pages` has *zero* effect on read chunk size.
+The real governing factor, confirmed by directly varying it: the
+guest's per-`bdi` `read_ahead_kb` (`/sys/class/bdi/<dev>/read_ahead_kb`,
+Linux's default is 128, i.e. exactly the 128 KiB observed) -- bumping it
+to 1024 on the same (post-fix) guest changed the trace to exactly 64
+`pread()` calls of exactly 1048576 bytes (1 MiB, capped by `max_write`,
+as expected) for the same file. `max_pages` was never involved.
+
+**Conclusion: the sequential-read improvement in the Run 2 -> Run 3 CI
+comparison was not caused by this fix.** It has to be attributed to
+run-to-run noise on the shared runner, the same phenomenon already
+documented for the metadata rows in both runs. This is worth stating
+plainly rather than quietly dropping: the initial write-up treated a
+correlation (fix shipped, read number improved) as if it had a
+plausible causal story, and that story turned out to be wrong when
+actually tested. The `max_pages` fix's real, *confirmed* effect remains
+exactly what the write-side trace showed: fewer/larger writes where the
+access pattern has real locality, no effect on random writes, and (now
+confirmed) no effect on reads of any pattern.
 
 ## Next steps (in priority order)
 
-1. **Confirm the sequential-read improvement's mechanism** by tracing
-   actual `pread()` sizes before/after the `max_pages` fix the same way
-   it was done for writes (add the equivalent instrumentation, or reuse
-   the existing `pread(...) took ...` trace already added to
-   `fuse::dispatch::Session::handle`, against a local guest with the
-   previous commit checked out for the "before" side). Turning a
-   plausible mechanism into a confirmed one before relying on it for
-   further decisions.
-2. **Investigate the *random write* gap specifically**, now that two
+1. **Investigate the *random write* gap specifically**, now that two
    independent protocol-level explanations (`max_write`, `max_pages`)
    have been checked and fixed on our side without closing it -- profile
    it the same way the random-read latency investigation was done above
@@ -402,27 +410,41 @@ mechanistically-plausible direction seems unlikely to be pure noise).
    `fuse::dispatch::Session::handle`; what's missing is doing the same
    for the *transport* side of a real random-write run specifically),
    rather than guessing at another flag or constant to tweak.
-3. **Add repeatability to this benchmark suite**: multiple runs with
+2. **Add repeatability to this benchmark suite**: multiple runs with
    variance reported. The run-to-run noise between the two virtiofsd
-   comparison runs above (visible in both backends' absolute numbers)
-   makes this the most concretely-justified item on this list, not just
-   a generic caveat anymore.
+   comparison runs above (visible in both backends' absolute numbers,
+   and now also directly implicated in a false-positive "fix" -- see
+   the sequential-read finding above) makes this the most
+   concretely-justified item on this list, not just a generic caveat
+   anymore.
+3. **Consider whether `read_ahead_kb` is worth tuning from riftlessfsd's
+   side.** It's confirmed to be the actual governing factor for
+   sequential read chunk size (see above), is a guest-side setting we
+   don't currently influence at all, and defaults to a conservative 128
+   KiB versus the 1 MiB `max_write`/`max_pages` ceiling we already
+   advertise -- there may be real headroom here, though changing a
+   guest sysfs tunable from a filesystem daemon (rather than e.g.
+   documenting it as a mount-time recommendation) needs some thought
+   about whether it's even riftlessfsd's place to do so.
 4. **Revisit attribute cache and `FOPEN_KEEP_CACHE` policy once there's
    real cache invalidation.** Both are currently unconditional with no
    active invalidation (e.g. on a rename/unlink another client might
    have cached, or a host-side write outside riftlessfsd), which matters
    more with multiple guests or host-side writers involved.
-5. **Investigate DAX/shared-memory-style reads** if (2) doesn't turn up
+5. **Investigate DAX/shared-memory-style reads** if (1) doesn't turn up
    a more targeted explanation -- a materially larger undertaking than
    anything done so far.
 
-"riftlessfs beats OrbStack" is still not a true statement -- random write
-throughput in particular is still meaningfully behind, by a margin that
-two concrete, verified protocol fixes (`max_write`, `max_pages`) did not
-move -- but the gap has narrowed substantially and specifically (not
-vaguely) across five sessions of real measurement, and matching (or
-beating) the reference implementation on every metadata operation, on
-random-read latency, and now on sequential-read throughput too is a
-real, positive data point, not just "less bad than before." This file is
+"riftlessfs beats OrbStack" is still not a true statement -- random
+write throughput in particular is still meaningfully behind, by a
+margin that two concrete, verified protocol fixes (`max_write`,
+`max_pages`) did not move -- but the gap has narrowed substantially and
+specifically (not vaguely) across five sessions of real measurement,
+and matching (or beating) the reference implementation on every
+metadata operation and on random-read latency is a real, positive data
+point, not just "less bad than before." (Sequential read briefly looked
+like a third win in this category too; directly testing that finding is
+what caught it as a false positive instead -- see above. That
+correction is itself part of what "honestly" means here.) This file is
 where the OrbStack claim gets re-evaluated honestly as more of the above
 lands.

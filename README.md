@@ -116,16 +116,22 @@ Given that, the plan is split into phases:
   regardless, because the FUSE ABI's `max_pages` field (not `max_write`)
   governs writeback batching, and it's silently ignored unless the
   `FUSE_MAX_PAGES` flag is set -- which riftlessfsd wasn't setting.
-  Fixing that (while leaving `max_write` alone) had a genuine surprise:
-  sequential *read* throughput jumped from 3.1x behind virtiofsd to
-  1.09x (near parity), plausibly because `max_pages` also bounds
-  readahead request size, not just writes -- and, exactly as predicted
-  beforehand from the write-size tracing, random write's ratio didn't
-  move at all (still ~3.3x), since a genuinely random access pattern
-  offers little for writeback to batch regardless of the ceiling. Two
-  fixes down, request-size mismatch is now ruled out twice over as the
-  random-write explanation, which needs its own targeted investigation
-  rather than another flag or constant to tweak.
+  Exactly as predicted from the write-size tracing, random write's
+  ratio didn't move at all after this fix (still ~3.3x), since a
+  genuinely random access pattern offers little for writeback to batch
+  regardless of the ceiling. Sequential read *also* jumped in that same
+  comparison run (3.1x behind virtiofsd to 1.09x), which looked like a
+  bonus win from the same fix -- but building both the pre- and
+  post-fix binaries and directly tracing `pread()` sizes against a cold
+  page cache showed the fix has *zero* effect on read chunk size
+  (identical 128 KiB chunks both before and after); the real governing
+  factor, confirmed by varying it directly, is the guest's
+  `read_ahead_kb` sysfs setting, unrelated to `max_pages`. So that
+  particular improvement was noise, not a third win -- a useful
+  reminder to test causal stories, not just trust a correlated number.
+  Two fixes down, request-size mismatch is now ruled out twice over as
+  the random-write explanation, which needs its own targeted
+  investigation rather than another flag or constant to tweak.
 
 ## How this was actually verified
 

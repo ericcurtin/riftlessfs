@@ -247,6 +247,14 @@ summarize() {
   done
   if [ -z "$matches" ]; then
     echo "$label ${candidates[0]}: no matching syscalls found (tried: ${candidates[*]})"
+    # Diagnostic fallback: list what write/read-related syscalls *did*
+    # occur, with counts, so a wrong guess at the candidate list doesn't
+    # require another round-trip through CI to find the actual name
+    # (this is exactly what caught virtiofsd using pwritev64/preadv64
+    # instead of pwrite64/pread64 -- see BENCHMARKS.md).
+    echo "  (syscalls containing 'write' or 'read' actually seen in this trace:)"
+    grep -ohE '[a-z_0-9]*(write|read)[a-z_0-9]*\(' "$file" 2>/dev/null |
+      sed 's/(//' | sort | uniq -c | sort -rn | sed 's/^/    /'
     return
   fi
   echo "$matches" | grep -oE '<[0-9.]+>$' | tr -d '<>' | awk -v label="$label" -v sc="$name" '
@@ -269,7 +277,13 @@ summarize() {
 echo "============================================================"
 echo "syscall timing (strace -T, wall time per call):"
 echo "============================================================"
-summarize "riftlessfsd" "$WORKDIR/riftless-strace.log" pwrite64 pwrite
-summarize "riftlessfsd" "$WORKDIR/riftless-strace.log" pread64 pread
-summarize "virtiofsd  " "$WORKDIR/virtiofsd-strace.log" pwrite64 pwrite
-summarize "virtiofsd  " "$WORKDIR/virtiofsd-strace.log" pread64 pread
+# riftlessfsd uses plain pwrite()/pread() (see
+# riftlessfs-core::passthrough); virtiofsd (fuse-backend-rs) uses
+# vectored I/O (pwritev64/preadv64) instead, discovered by this
+# script's own diagnostic fallback on its first run against real
+# hardware -- see BENCHMARKS.md. Trying both forms for both binaries
+# rather than hardcoding what each *currently* does.
+summarize "riftlessfsd" "$WORKDIR/riftless-strace.log" pwrite64 pwrite pwritev64 pwritev
+summarize "riftlessfsd" "$WORKDIR/riftless-strace.log" pread64 pread preadv64 preadv
+summarize "virtiofsd  " "$WORKDIR/virtiofsd-strace.log" pwritev64 pwritev pwrite64 pwrite
+summarize "virtiofsd  " "$WORKDIR/virtiofsd-strace.log" preadv64 preadv pread64 pread

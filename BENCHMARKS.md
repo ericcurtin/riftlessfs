@@ -460,31 +460,117 @@ host filesystem, so it's not yet known whether virtiofsd pays the same
 per-syscall cost and simply amortizes it better (e.g. via a genuinely
 different I/O mechanism), or avoids much of it entirely.
 
+### Testing that theory on the actual hardware: it doesn't hold up either
+
+Built `scripts/syscall-cost-compare.sh` + `.github/workflows/syscall-cost-compare.yml`:
+a narrow companion to `compare-virtiofsd.sh` that wraps both daemons in
+`strace -f -T` from process start (avoiding the need to attach to an
+already-running PID) and runs a small 16 MiB random-write/random-read
+fio job purely to compare `pwrite`/`pread`-family syscall timing --
+deliberately a separate script, since tracing overhead would distort
+the throughput numbers `compare-virtiofsd.sh` exists to report cleanly.
+
+First run immediately found something not anticipated: riftlessfsd's
+numbers came through as expected (`pwrite64`), but virtiofsd showed
+**zero** `pwrite64` calls. Its diagnostic fallback (list whatever
+write/read syscalls actually appear, added after this exact surprise)
+revealed why: virtiofsd doesn't call plain `pwrite`/`pread` at all --
+it uses vectored I/O, `pwritev2` and `preadv`. Two script iterations
+later (each guided by the actual trace output rather than more
+guessing), stable numbers on `linux-x86_64`:
+
+| | avg. syscall time | count |
+|---|---|---|
+| riftlessfsd `pwrite64` | 46.3 us | 2143 |
+| riftlessfsd `pread64` | 32.3 us | 4098 |
+| virtiofsd `pwritev2` | 40.5 us | 2168 |
+| virtiofsd `preadv` | 28.5 us | 4096 |
+
+**The write-vs-read ratio is nearly identical between the two
+implementations (riftlessfsd 1.43x, virtiofsd 1.42x), and the absolute
+magnitudes are close (riftlessfsd ~13-14% slower for both operations,
+not specifically for writes).** This directly refutes the theory above:
+on the actual comparison hardware, `pwrite`/`pwritev2` is *not*
+disproportionately slower than `pread`/`preadv` for riftlessfsd
+relative to virtiofsd -- both pay a broadly similar, modest write
+premium. Syscall counts are also nearly identical (2143 vs. 2168),
+ruling out "virtiofsd merges more logical writes per syscall" as an
+explanation too. Whatever produces the ~3.3x *throughput* gap despite
+near-identical *syscall* costs and counts has to be something else --
+this local-testing-derived theory is a second one (after the
+sequential-read case) that looked plausible and didn't survive being
+tested directly on the hardware that actually matters. Recording that
+plainly rather than quietly moving on, same as before.
+
+### A confirmed, real structural difference: zero-copy I/O
+
+Investigating where else the difference could be (given syscalls
+themselves are now ruled out) led to reading virtiofsd's actual
+`read`/`write` implementation
+(`fuse-backend-rs`/`virtiofsd`'s `passthrough/mod.rs`): it uses
+`ZeroCopyReader`/`ZeroCopyWriter` traits whose `read_from_file_at`/
+`write_to_file_at` methods are explicitly documented as using
+`preadv64`/`pwritev2` -- i.e. virtiofsd builds an iovec pointing
+*directly into the guest's mapped memory* and hands it straight to the
+vectored syscall, with **no intermediate host-side buffer copy at
+all**.
+
+riftlessfsd does not do this. `Virtqueue::gather_readable` copies every
+readable descriptor segment into a heap-allocated `Vec<u8>` before
+`fuse::dispatch::Session::handle` ever sees the request (so `WRITE`'s
+payload is copied guest-memory -> heap, then `pwrite()` copies
+heap -> kernel page cache -- two copies where virtiofsd's `pwritev2`
+does one), and `Virtqueue::scatter_writable` copies the reply
+(including `READ`'s payload) from a heap `Vec<u8>` back into guest
+memory (again, an extra copy `preadv` avoids).
+
+This is a real, source-confirmed architectural difference, not a
+guess -- but its *quantitative* contribution to the ~3.3x random-write
+gap is still unknown: the extra copy is proportional to request size,
+and at 4 KiB it's sub-microsecond, small next to the tens-of-microseconds
+syscall costs measured above. It's plausible this matters more
+cumulatively (extra CPU work per request, in a single-threaded
+process-everything-sequentially loop) than any single measurement
+here has isolated, but that's not yet demonstrated the way the syscall
+comparison was. Implementing the equivalent zero-copy path in
+riftlessfsd (building `iovec`s directly from `chain.readable`/
+`chain.writable`'s guest-memory slices and using `preadv`/`pwritev`
+instead of gathering into a `Vec` first) is a legitimate, well-motivated
+optimization either way -- it's strictly less work per request even if
+it turns out not to be *the* answer to this specific gap -- and
+re-measuring after implementing it would also finally give a real
+answer to how much it mattered here.
+
 ## Next steps (in priority order)
 
-1. **Confirm (or refute) the `pwrite`-vs-`pread` syscall-cost theory on
-   the actual comparison hardware** -- the current best explanation for
-   the random-write gap, but not yet confirmed there. Two things
-   needed: (a) run the same opcode-aware trace against a Linux/ext4 host
-   (e.g. as an extra, separate step in `compare-virtiofsd.yml` -- not
-   folded into the main benchmarked run itself, since trace-level
-   logging overhead would unfairly slow down riftlessfsd's own
-   *benchmarked* numbers) to see if the same asymmetry exists there;
-   (b) get an equivalent measurement for virtiofsd itself (e.g. via
-   `strace -T -e trace=pwrite64,pread64` around a short run, since it
-   has no equivalent built-in trace logging) to see whether it pays a
-   similar per-syscall cost or avoids it via a different write path. If
-   neither confirms the theory, fall back to profiling the *transport*
-   side of a real random-write run the way the random-read investigation
-   profiled reads, rather than guessing at another flag or constant.
-2. **Add repeatability to this benchmark suite**: multiple runs with
+1. **Implement zero-copy read/write paths in riftlessfsd**, building
+   `iovec`s directly from `chain.readable`/`chain.writable`'s
+   guest-memory slices and using `preadv`/`pwritev` instead of
+   `Virtqueue::gather_readable`/`scatter_writable`'s current
+   copy-through-`Vec<u8>` approach -- confirmed via virtiofsd's own
+   source to be the one concrete, real structural difference found so
+   far (see above), a legitimate improvement regardless of how much of
+   the random-write gap it turns out to explain, and re-measure
+   afterward with both `compare-virtiofsd.yml` and
+   `syscall-cost-compare.yml` to quantify the actual effect rather than
+   assuming one.
+2. If that doesn't close the gap, **look for concurrency/pipelining
+   differences** -- given syscall-level costs and counts are now
+   confirmed nearly identical between the two implementations, but
+   overall throughput differs ~3.3x, something about how many requests
+   each backend can have genuinely in flight/overlapping at once (not
+   just batched-but-processed-sequentially, which riftlessfsd already
+   does -- see `Server::process_vring`'s docs) is the remaining
+   candidate explanation, though nothing concrete has been found here
+   yet.
+3. **Add repeatability to this benchmark suite**: multiple runs with
    variance reported. The run-to-run noise between the two virtiofsd
    comparison runs above (visible in both backends' absolute numbers,
    and now also directly implicated in a false-positive "fix" -- see
    the sequential-read finding above) makes this the most
    concretely-justified item on this list, not just a generic caveat
    anymore.
-3. **Consider whether `read_ahead_kb` is worth tuning from riftlessfsd's
+4. **Consider whether `read_ahead_kb` is worth tuning from riftlessfsd's
    side.** It's confirmed to be the actual governing factor for
    sequential read chunk size (see above), is a guest-side setting we
    don't currently influence at all, and defaults to a conservative 128
@@ -493,25 +579,32 @@ different I/O mechanism), or avoids much of it entirely.
    guest sysfs tunable from a filesystem daemon (rather than e.g.
    documenting it as a mount-time recommendation) needs some thought
    about whether it's even riftlessfsd's place to do so.
-4. **Revisit attribute cache and `FOPEN_KEEP_CACHE` policy once there's
+5. **Revisit attribute cache and `FOPEN_KEEP_CACHE` policy once there's
    real cache invalidation.** Both are currently unconditional with no
    active invalidation (e.g. on a rename/unlink another client might
    have cached, or a host-side write outside riftlessfsd), which matters
    more with multiple guests or host-side writers involved.
-5. **Investigate DAX/shared-memory-style reads** if (1) doesn't turn up
+6. **Investigate DAX/shared-memory-style reads** if (1) doesn't turn up
    a more targeted explanation -- a materially larger undertaking than
    anything done so far.
 
 "riftlessfs beats OrbStack" is still not a true statement -- random
 write throughput in particular is still meaningfully behind, by a
-margin that two concrete, verified protocol fixes (`max_write`,
-`max_pages`) did not move -- but the gap has narrowed substantially and
-specifically (not vaguely) across five sessions of real measurement,
+margin that neither of two concrete, verified protocol fixes
+(`max_write`, `max_pages`) moved, and that direct syscall-level
+measurement on the actual comparison hardware has now ruled out
+"riftlessfsd's own `pwrite` calls are disproportionately slow" as the
+explanation for -- but the gap has narrowed substantially and
+specifically (not vaguely) across six sessions of real measurement,
 and matching (or beating) the reference implementation on every
 metadata operation and on random-read latency is a real, positive data
 point, not just "less bad than before." (Sequential read briefly looked
-like a third win in this category too; directly testing that finding is
-what caught it as a false positive instead -- see above. That
-correction is itself part of what "honestly" means here.) This file is
-where the OrbStack claim gets re-evaluated honestly as more of the above
-lands.
+like a third win in this category too, and the syscall-cost theory
+briefly looked like it might explain the write gap; directly testing
+both is what caught them as dead ends instead -- see above. That kind
+of correction is itself part of what "honestly" means here.) The one
+concrete, source-confirmed structural difference found so far --
+virtiofsd's zero-copy I/O versus riftlessfsd's copy-through-a-buffer
+approach -- is next in line to actually implement and measure, rather
+than add to the pile of untested theories. This file is where the
+OrbStack claim gets re-evaluated honestly as more of the above lands.

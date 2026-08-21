@@ -825,21 +825,58 @@ it turns out not to be *the* answer to this specific gap -- and
 re-measuring after implementing it would also finally give a real
 answer to how much it mattered here.
 
+### Implemented it. Measured effect: none clearly visible, as predicted.
+
+Implemented the zero-copy path: `Virtqueue::iovecs_from` builds
+`iovec`s directly from a chain's guest-memory segments (handling a
+header that doesn't land on a descriptor boundary, and capping to a
+request's declared size), `PassthroughFs::read_vectored`/
+`write_vectored` call `preadv`/`pwritev` with them, and
+`Server::process_vring` routes `WRITE`/`READ` through this path
+(falling back to the original gather-into-`Vec` path for every other
+opcode, and for `WRITE`/`READ` themselves if header parsing ever
+fails). Verified correct well beyond unit tests: a real daemon through
+the local QEMU/HVF guest, with `sha256sum`-verified round trips at the
+exact 1 MiB `max_write` boundary, a 64 MiB multi-request transfer, an
+odd (12345-byte, non-page-aligned) size, and EOF-adjacent reads.
+
+This was flagged in advance as *not* expected to close the
+random-write gap specifically -- the byte-copy avoided is
+sub-microsecond at the sizes involved, dwarfed by the tens-of-
+microseconds-per-syscall and ~120 us-per-round-trip costs measured
+elsewhere in this document. Measuring it directly (both comparisons
+re-run against the exact same commit, same methodology as before)
+confirmed that prediction rather than just assuming it:
+
+| | before (v6 / prior virtiofsd run) | after (zero-copy) |
+|---|---|---|
+| vs. OrbStack, random write | ~1.8-2.3x ahead | ~1.7x ahead (still solidly ahead, same ballpark) |
+| vs. OrbStack, random read | ~15.3-15.4x behind | ~17.0x behind (within this comparison's established noise band) |
+| vs. virtiofsd, random write | ~3.3x behind | ~3.3x behind (unchanged) |
+| vs. virtiofsd, random read | ~parity/slightly ahead | ~parity/slightly ahead (unchanged) |
+| vs. virtiofsd, sequential write | ~2.1-2.15x behind | ~2.95x behind (single run; within the range already seen for this specific noisy metric, not a confirmed regression) |
+
+**No clearly-attributable improvement or regression in either
+comparison.** This isn't a null result in the sense of "the work was
+wasted" -- the change is real, correct, verified, and does strictly
+less work per request (one copy instead of two for large payloads) --
+it's a null result in the sense of "this wasn't where the bottleneck
+was," matching the analysis above and the earlier discovery that
+virtiofsd (which already has zero-copy) doesn't beat riftlessfsd on
+random read either. Kept because it's a legitimate improvement on its
+own terms (less CPU work per request, no new attack surface, unlike
+the DAX alternative), not because it moved a benchmark number.
+
 ## Next steps (in priority order)
 
-Reordered again after the latency-arithmetic analysis above: it's now
-a specific, quantitative, *not yet acted on* hypothesis that random
-read's gap is transport-level (DAX/shared-memory vs. per-request
-round trips), not something the current protocol-tuning playbook
-(request size, batching limits, zero-copy) can close -- so validating
-or implementing that belongs above further tuning of the current
-transport, even though it's the largest undertaking on this list.
-Zero-copy I/O is still worth doing (bounded, safe, useful for CPU
-efficiency and whatever fraction of the write-side gaps it does
-explain), just not expected to move random read specifically anymore.
+Zero-copy I/O (previously listed here) is now implemented and
+measured -- see above -- with no clearly-attributable effect on any
+benchmark in either comparison. That leaves DAX as the one remaining
+concrete, quantitative hypothesis for random read specifically, and
+the least-tried, most-eliminated-alternatives item overall.
 
-1. **Investigate DAX/shared-memory-style reads for real**, now backed
-   by a specific number to validate against rather than "OrbStack is
+1. **Investigate DAX/shared-memory-style reads for real**, backed by a
+   specific number to validate against rather than "OrbStack is
    probably fancier": if a working implementation doesn't get
    random-read's per-request latency down from ~56 us into single-digit
    microseconds, the DAX hypothesis itself was wrong and needs revisiting,
@@ -850,27 +887,18 @@ explain), just not expected to move random read specifically anymore.
    and real security-surface implications of mapping host memory
    directly into a guest) -- likely worth its own design pass before
    writing code, not a quick follow-up.
-2. **Implement zero-copy read/write paths in riftlessfsd** in the
-   meantime, building `iovec`s directly from `chain.readable`/
-   `chain.writable`'s guest-memory slices and using `preadv`/`pwritev`
-   instead of `Virtqueue::gather_readable`/`scatter_writable`'s current
-   copy-through-`Vec<u8>` approach -- confirmed via virtiofsd's own
-   source to be a real structural difference (see above), bounded and
-   safe (no protocol changes, no new attack surface, unlike DAX), and
-   a legitimate improvement on its own terms even now that it's not
-   expected to be *the* answer to random read. Re-measure afterward
-   against both virtiofsd and OrbStack to get a real number instead of
-   an assumption either way.
-3. **Add more repeatability to this benchmark suite.** Fix 5 already
+2. **Add more repeatability to this benchmark suite.** Fix 5 already
    added 3-run min/avg/max reporting for the OrbStack comparison (a
    real improvement over the historical single run), but 3 is still a
    small sample -- and the `-smp` confound encountered while
-   investigating Fix 5 is a concrete reminder that ad hoc re-runs can
-   introduce new confounds as easily as they control for old ones.
-   Worth scripting the whole OrbStack comparison (both sides,
-   N repeats, VM parameters pinned explicitly) rather than doing it by
-   hand each time.
-4. **Consider whether `read_ahead_kb` is worth tuning/documenting from
+   investigating Fix 5, plus the zero-copy measurement above landing
+   well inside pre-existing noise bands in both directions, are
+   concrete reminders that ad hoc re-runs can introduce new confounds
+   as easily as they control for old ones, and that small effect sizes
+   need more than 3 runs to trust either way. Worth scripting the whole
+   OrbStack comparison (both sides, N repeats, VM parameters pinned
+   explicitly) rather than doing it by hand each time.
+3. **Consider whether `read_ahead_kb` is worth tuning/documenting from
    riftlessfsd's side.** Confirmed to be the actual governing factor for
    sequential read chunk size (see above), is a guest-side setting
    riftlessfsd doesn't currently influence at all, and defaults to a
@@ -878,12 +906,12 @@ explain), just not expected to move random read specifically anymore.
    ceiling already advertised -- there may be real headroom here, same
    category of fix as Fix 5's memory-sizing finding (a guest/deployment
    tunable, not a protocol change).
-5. **Revisit attribute cache and `FOPEN_KEEP_CACHE` policy once there's
+4. **Revisit attribute cache and `FOPEN_KEEP_CACHE` policy once there's
    real cache invalidation.** Both are currently unconditional with no
    active invalidation (e.g. on a rename/unlink another client might
    have cached, or a host-side write outside riftlessfsd), which matters
    more with multiple guests or host-side writers involved.
-6. If DAX turns out infeasible or doesn't pan out as hypothesized,
+5. If DAX turns out infeasible or doesn't pan out as hypothesized,
    **look for concurrency/pipelining differences** as a fallback --
    given syscall-level costs and counts are already confirmed nearly
    identical to virtiofsd's, but overall write throughput still
@@ -893,9 +921,10 @@ explain), just not expected to move random read specifically anymore.
    found here yet.
 
 "riftlessfs beats OrbStack" is still not a true statement overall --
-**random read remains 15x behind**, by a margin nothing tried so far
-has moved (request size, syscall cost, and VM memory sizing are all
-now specifically ruled out as the explanation) -- but the rest of the
+**random read remains ~15-17x behind**, by a margin nothing tried so
+far has moved (request size, syscall cost, VM memory sizing, and now
+zero-copy I/O are all specifically ruled out as the explanation) --
+but the rest of the
 picture has changed substantially since that sentence was first
 written: **random write measures consistently ahead of OrbStack**
 across two independent 3-run samples, and **sequential write's gap

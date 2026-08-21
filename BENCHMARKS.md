@@ -3,21 +3,24 @@
 **Status: still behind OrbStack overall, but ahead on one real benchmark
 (random write), with sequential write's gap cut from 10x to 2.6x by
 fixing a real benchmark methodology bug (the test VM was memory-starved
-relative to OrbStack's default), and random read now clearly the single
-largest remaining gap.** This is Phase 4 from the README. Six real
-bugs/gaps have been found and fixed by actually running these
-benchmarks so far, plus one methodology bug in the benchmarks
-themselves; the honest headline is still **riftlessfs does not beat
-OrbStack overall**, but sequential write is down to 2.6x behind (from
-an apparent 10x, most of which turned out to be an unfair 2 GiB vs. 16
-GiB VM memory comparison -- see "Fix 5" below), sequential read is down
-to ~2x behind (from 7.6x originally), random write is measured *ahead*
-of OrbStack consistently across two independent 3-run samples, and a
-same-hardware comparison against the *reference* vhost-user-fs
-implementation (stock `virtiofsd` on real Linux + KVM) found and ruled
-out several specific theories for what remains, narrowing it down to a
-confirmed, real architectural difference
-(zero-copy I/O) worth acting on next.
+relative to OrbStack's default), and random read the one remaining
+large gap -- now understood well enough, after real elimination, to
+suspect it may be a genuine architectural ceiling rather than an
+unfixed bug.** This is Phase 4 from the README. Six real bugs/gaps
+have been found and fixed by actually running these benchmarks so far,
+plus one methodology bug in the benchmarks themselves; the honest
+headline is still **riftlessfs does not beat OrbStack overall**, but
+sequential write is down to 2.6x behind (from an apparent 10x, most of
+which turned out to be an unfair 2 GiB vs. 16 GiB VM memory comparison
+-- see "Fix 5" below), sequential read is down to ~2x behind (from
+7.6x originally), random write is measured *ahead* of OrbStack
+consistently across two independent 3-run samples, and a same-hardware
+comparison against the *reference* vhost-user-fs implementation (stock
+`virtiofsd` on real Linux + KVM) found and ruled out several specific
+theories for what remains, including a confirmed real architectural
+difference (zero-copy I/O, since implemented and measured to have no
+clear effect) and DAX (found to be unachievable via the standard
+vhost-user-fs/QEMU stack this project targets, not merely untried).
 
 ## Methodology
 
@@ -430,6 +433,62 @@ Matching it would require riftlessfs to implement the same category of
 mechanism (DAX/shared-memory reads, `Next steps` item below), which is
 a materially larger undertaking than anything implemented in this
 project so far -- not a specific missing flag or constant.
+
+### Following up on that: DAX has been removed from QEMU and virtiofsd, not just underused
+
+Before spending real effort designing a DAX implementation, it was
+worth checking what the reference implementation and its VMM actually
+support today -- and the answer is: neither supports it anymore.
+
+- **virtiofsd's current `FileSystem` trait
+  (`src/filesystem.rs`) has no `setupmapping`/`removemapping` methods
+  at all** -- no way for a filesystem implementation to participate in
+  DAX mapping requests even if it wanted to. (Historically, `virtio-fs`
+  did define `FUSE_SETUPMAPPING`/`FUSE_REMOVEMAPPING` for exactly this,
+  and it's still in the kernel-side FUSE ABI header -- but the current
+  virtiofsd simply never wires it up to anything.)
+- **QEMU 11.0.2's `vhost-user-fs-pci` device has no `cache-size`
+  property** (the option that used to size a DAX shared-memory window)
+  -- confirmed both from `-device vhost-user-fs-pci,help`'s full option
+  list and by `grep`-ing the actual built QEMU source
+  (`hw/virtio/vhost-user-fs.c`/`.h`) for `cache`, `dax`, `SETUPMAPPING`,
+  and `shared_memory`/`shmem`: zero matches. The DAX window mechanism
+  simply isn't compiled into this QEMU build's vhost-user-fs
+  implementation at all.
+
+**This changes the DAX item from "a materially larger undertaking" to
+"not achievable via the standard vhost-user-fs protocol and QEMU at
+all, without first reviving functionality the ecosystem itself has
+moved away from."** riftlessfs could theoretically still build a
+*custom*, non-standard shared-memory extension on top of vhost-user
+(vhost-user itself supports arbitrary additional memory regions via
+`SET_MEM_TABLE`, so the raw mechanism for sharing memory isn't gone --
+what's gone is the specific FUSE-integrated DAX window/mapping
+protocol and QEMU's support for exposing it as a device-visible BAR),
+but that would mean designing and maintaining a bespoke protocol with
+no reference implementation to check against, for a *hypervisor +
+VMM* combination (a custom QEMU build) rather than something
+achievable purely in riftlessfsd. That's a fundamentally different,
+much bigger commitment than "implement one more FUSE feature," and
+inconsistent with this project's stated goal of working with ordinary,
+unpatched QEMU wherever `vhost-user-fs-pci` support already exists.
+
+**Honest implication for the random-read gap**: it may not be closeable
+within riftlessfs's current architecture (portable vhost-user-fs over
+standard QEMU) at all. OrbStack's ~3.7 us implied per-request latency
+almost certainly comes from a mechanism only available to a
+hypervisor-integrated, non-QEMU, non-standard-vhost-user
+implementation (consistent with OrbStack's own docs describing
+services "purpose-built from scratch" and explicitly *not* using
+QEMU) -- not from an optimization riftlessfs failed to apply. This
+doesn't mean giving up on the random-read metric entirely (the
+concurrency/pipelining fallback below is still untried, and every
+other benchmark in this suite has already improved substantially), but
+it does mean the specific "match a 3.7 us round trip" bar set earlier
+in this section is very likely unreachable while riftlessfs remains a
+portable, standard-QEMU-compatible vhost-user-fs implementation --
+worth stating plainly rather than treating DAX as a deferred to-do
+item that will eventually get done.
 
 ## Where the per-request latency actually goes (and a negative result)
 
@@ -870,34 +929,42 @@ the DAX alternative), not because it moved a benchmark number.
 ## Next steps (in priority order)
 
 Zero-copy I/O (previously listed here) is now implemented and
-measured -- see above -- with no clearly-attributable effect on any
-benchmark in either comparison. That leaves DAX as the one remaining
-concrete, quantitative hypothesis for random read specifically, and
-the least-tried, most-eliminated-alternatives item overall.
+measured, with no clearly-attributable effect on any benchmark in
+either comparison. DAX (also previously listed here as the top
+priority) turned out to be **not achievable via the standard
+vhost-user-fs protocol and QEMU at all** -- both have dropped the
+DAX/shared-memory-window mechanism -- so it's demoted from "top
+priority, needs a design pass" to "not on the table unless the
+project's scope changes to include maintaining a custom QEMU fork,"
+which is a much bigger decision than a benchmarking next-step. That
+leaves random read's ~15-17x gap without a concrete, actionable
+hypothesis left to try from this document's own investigation so far;
+the remaining items are either smaller, more speculative bets on that
+specific gap, or genuinely separate improvements that don't depend on
+resolving it.
 
-1. **Investigate DAX/shared-memory-style reads for real**, backed by a
-   specific number to validate against rather than "OrbStack is
-   probably fancier": if a working implementation doesn't get
-   random-read's per-request latency down from ~56 us into single-digit
-   microseconds, the DAX hypothesis itself was wrong and needs revisiting,
-   not just an implementation detail. This is a materially larger
-   undertaking than anything else in this project so far (vhost-user
-   shared-memory-region negotiation, `FUSE_SETUPMAPPING`/
-   `REMOVEMAPPING` support that riftlessfsd doesn't have at all today,
-   and real security-surface implications of mapping host memory
-   directly into a guest) -- likely worth its own design pass before
-   writing code, not a quick follow-up.
+1. **Look for concurrency/pipelining differences**, now the least-bad
+   remaining hypothesis for random read specifically (not because it's
+   strongly evidenced, but because request-size, syscall cost, VM
+   memory sizing, zero-copy, and now DAX have all been ruled out or
+   ruled infeasible) -- given syscall-level costs and counts are
+   already confirmed nearly identical to virtiofsd's, but overall write
+   throughput still differs there, something about how many requests
+   each backend can have genuinely in flight/overlapping at once is
+   worth checking against OrbStack too, though nothing concrete has
+   been found here yet and this may turn out to be another dead end
+   like the ones already recorded above.
 2. **Add more repeatability to this benchmark suite.** Fix 5 already
    added 3-run min/avg/max reporting for the OrbStack comparison (a
    real improvement over the historical single run), but 3 is still a
    small sample -- and the `-smp` confound encountered while
-   investigating Fix 5, plus the zero-copy measurement above landing
-   well inside pre-existing noise bands in both directions, are
-   concrete reminders that ad hoc re-runs can introduce new confounds
-   as easily as they control for old ones, and that small effect sizes
-   need more than 3 runs to trust either way. Worth scripting the whole
-   OrbStack comparison (both sides, N repeats, VM parameters pinned
-   explicitly) rather than doing it by hand each time.
+   investigating Fix 5, plus the zero-copy measurement landing well
+   inside pre-existing noise bands in both directions, are concrete
+   reminders that ad hoc re-runs can introduce new confounds as easily
+   as they control for old ones, and that small effect sizes need more
+   than 3 runs to trust either way. Worth scripting the whole OrbStack
+   comparison (both sides, N repeats, VM parameters pinned explicitly)
+   rather than doing it by hand each time.
 3. **Consider whether `read_ahead_kb` is worth tuning/documenting from
    riftlessfsd's side.** Confirmed to be the actual governing factor for
    sequential read chunk size (see above), is a guest-side setting
@@ -905,40 +972,44 @@ the least-tried, most-eliminated-alternatives item overall.
    conservative 128 KiB versus the 1 MiB `max_write`/`max_pages`
    ceiling already advertised -- there may be real headroom here, same
    category of fix as Fix 5's memory-sizing finding (a guest/deployment
-   tunable, not a protocol change).
+   tunable, not a protocol change). Unlike the random-read items above,
+   this is a genuinely separate, still-open, still-actionable lever.
 4. **Revisit attribute cache and `FOPEN_KEEP_CACHE` policy once there's
    real cache invalidation.** Both are currently unconditional with no
    active invalidation (e.g. on a rename/unlink another client might
    have cached, or a host-side write outside riftlessfsd), which matters
    more with multiple guests or host-side writers involved.
-5. If DAX turns out infeasible or doesn't pan out as hypothesized,
-   **look for concurrency/pipelining differences** as a fallback --
-   given syscall-level costs and counts are already confirmed nearly
-   identical to virtiofsd's, but overall write throughput still
-   differs there, something about how many requests each backend can
-   have genuinely in flight/overlapping at once is a candidate worth
-   checking against OrbStack too, though nothing concrete has been
-   found here yet.
+5. **Accept that random read specifically may remain a permanent,
+   architecture-level gap** if (1) doesn't pan out either, and focus
+   further effort on the metrics that are demonstrably closeable within
+   riftlessfs's current design (everything else in this suite has
+   improved substantially over the course of this document) rather
+   than continuing to look for a way to match a transport-level
+   advantage this project's own architecture may not be able to
+   provide. This isn't giving up on honesty about the gap -- it's the
+   honest conclusion the last several rounds of elimination point to.
 
 "riftlessfs beats OrbStack" is still not a true statement overall --
 **random read remains ~15-17x behind**, by a margin nothing tried so
-far has moved (request size, syscall cost, VM memory sizing, and now
-zero-copy I/O are all specifically ruled out as the explanation) --
-but the rest of the
+far has moved (request size, syscall cost, VM memory sizing, and
+zero-copy I/O are all specifically ruled out as the explanation, and
+the one mechanism that would plausibly explain OrbStack's number --
+DAX -- turns out not to be achievable via the standard vhost-user-fs
+protocol and QEMU that this project targets) -- but the rest of the
 picture has changed substantially since that sentence was first
 written: **random write measures consistently ahead of OrbStack**
 across two independent 3-run samples, and **sequential write's gap
 went from an apparent 10x to 2.6x** once a real flaw in this document's
 own benchmark setup (an unfairly memory-starved test VM) was found and
 fixed -- not a code change, but exactly the kind of correction this
-document has tried to make a habit of, same as the sequential-read and
-`pwrite`-cost dead ends recorded above. Three of five benchmark
-categories (random write, sequential write, and -- more provisionally
--- sequential read) are now either ahead or within reach; one category
-(metadata) is a stable, secondary, ~4-5x gap; and one (random read) has
-a specific, quantitative, but *not yet validated or acted on*
-hypothesis (DAX/shared-memory reads bypassing the per-request round
-trip entirely -- see above) rather than being a mystery. That's a
-materially more specific and more encouraging state than "still
+document has tried to make a habit of, same as the sequential-read,
+`pwrite`-cost, and (in a different way) DAX dead ends recorded above.
+Three of five benchmark categories (random write, sequential write,
+and -- more provisionally -- sequential read) are now either ahead or
+within reach; one category (metadata) is a stable, secondary, ~4-5x
+gap; and one (random read) looks, after real elimination rather than
+assumption, like it may be a genuine architectural ceiling rather than
+an unfixed bug -- an honest, specific conclusion, even if not the
+hoped-for one. That's a materially more specific state than "still
 behind" implies, even though it remains true. This file is where the
 OrbStack claim gets re-evaluated honestly as more of the above lands.

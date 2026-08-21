@@ -35,22 +35,41 @@ with the protocol fixes: sequential write is now 2.6x behind OrbStack
 **random write measures *ahead* of OrbStack**, consistently across two
 independent 3-run samples with non-overlapping ranges both times --
 the most solid result in this comparison so far. **Random read remains
-the one clear, unexplained, large gap (~15x behind)**, and is next in
-line for the same kind of trace-driven investigation that resolved the
-others, now that request size, syscall cost, and VM memory sizing have
-all been specifically ruled out as its cause. A separate, same-hardware
-comparison against the *reference* vhost-user-fs implementation (stock
-`virtiofsd`) -- used to isolate the backend implementation from
-OrbStack's other differences, not as the actual goal -- found
-riftlessfs matches or beats it on metadata operations and random-read
-latency, ruled out two theories for the remaining write/read throughput
-gap there (`max_write`/`max_pages` already being correct on our side; a
+the one clear, large gap (~15-17x behind)**, and has now had the same
+trace-driven elimination applied to it that resolved the others:
+request size, syscall cost, VM memory sizing, and a subsequently
+*implemented* zero-copy I/O path have all been ruled out (measured, not
+assumed) as the explanation, and arithmetic on OrbStack's own IOPS
+number (~3.7 us implied per-request latency -- not physically
+plausible for a real message round trip to a separate process, but
+very plausible for a guest-side page fault against directly-mapped
+host memory) points at DAX/shared-memory reads as the mechanism that
+would close it. Checking whether that's actually buildable found it
+isn't, at least not without much bigger scope: **both QEMU and
+virtiofsd have removed DAX support from their current versions**
+(confirmed directly -- virtiofsd's `FileSystem` trait has no
+`setupmapping`/`removemapping` methods at all, and QEMU 11.0.2's
+`vhost-user-fs-pci` device has no `cache-size` option, verified by
+grepping its actual source for any DAX-related code and finding none).
+Matching OrbStack there would mean designing a bespoke protocol
+extension with no reference implementation, for a hypervisor + VMM
+combination (a custom QEMU fork) rather than something achievable in
+riftlessfsd alone -- inconsistent with this project's goal of working
+with ordinary, unpatched QEMU. Honest current conclusion: random
+read's gap may be a genuine architectural ceiling of the
+portable-vhost-user-fs-over-standard-QEMU approach, not a bug waiting
+to be fixed. A separate, same-hardware comparison against the
+*reference* vhost-user-fs implementation (stock `virtiofsd`) -- used
+to isolate the backend implementation from OrbStack's other
+differences, not as the actual goal -- found riftlessfs matches or
+beats it on metadata operations and random-read latency, and ruled out
+three theories for the remaining write/read throughput gap there
+(`max_write`/`max_pages` already being correct on our side; a
 `pwrite`-vs-`pread` syscall cost difference, refuted by direct
-measurement on real hardware), and found one confirmed real difference
-worth acting on: virtiofsd does zero-copy I/O directly against guest
-memory, while riftlessfsd copies through a heap buffer. Windows has no
-transport at all (see Phase 3), and FUSE opcode coverage, while enough
-for real everyday use, isn't exhaustive (xattrs, POSIX
+measurement on real hardware; and the zero-copy I/O difference it does
+have confirmed but which measured no effect once implemented). Windows
+has no transport at all (see Phase 3), and FUSE opcode coverage, while
+enough for real everyday use, isn't exhaustive (xattrs, POSIX
 locks, and a few other opcodes currently reply `ENOSYS`). This README
 stays explicit about what's proven versus what isn't, so nobody mistakes
 "it mounts, is correct, and is ahead on one real benchmark now" for
@@ -214,9 +233,46 @@ Given that, the plan is split into phases:
   explanation is actually right, not a coincidence. **Random read is
   now clearly the single largest, least-understood gap** (~15x behind,
   unmoved by request size, syscall cost, or this memory fix -- all
-  specifically ruled out) and the top priority for the next round of
-  investigation. See BENCHMARKS.md's "Fix 5" section for the full
-  before/after tables and caveats.
+  specifically ruled out). See BENCHMARKS.md's "Fix 5" section for the
+  full before/after tables and caveats.
+
+  The zero-copy I/O path identified earlier was then actually
+  implemented (`Virtqueue::iovecs_from` building `iovec`s directly from
+  guest memory, `PassthroughFs::read_vectored`/`write_vectored` calling
+  `preadv`/`pwritev`) and verified thoroughly -- 13 new tests including
+  real end-to-end multi-descriptor roundtrips through an actual
+  virtqueue, plus `sha256sum`-checked correctness through a real QEMU
+  guest at the exact 1 MiB `max_write` boundary and other edge cases --
+  then re-measured against both comparisons. Result: no
+  clearly-attributable improvement or regression in either one. Not a
+  wasted effort (the change is real, correct, and strictly reduces
+  per-request work), but a clear signal that copy avoidance wasn't
+  where this specific bottleneck lives, consistent with virtiofsd
+  (which already has zero-copy) not beating riftlessfsd on random read
+  either.
+
+  That left DAX as the one mechanism arithmetic on OrbStack's own IOPS
+  number (~3.7 us implied per-request latency for random 4 KiB reads --
+  not physically plausible for a real round trip to a separate process,
+  but plausible for a guest-side page fault against directly-mapped
+  host memory) pointed to. Checking whether it's actually buildable
+  found that **both QEMU and virtiofsd have removed DAX support from
+  their current versions** -- virtiofsd's `FileSystem` trait has no
+  `setupmapping`/`removemapping` methods at all, and QEMU 11.0.2's
+  `vhost-user-fs-pci` device has no `cache-size` option (confirmed by
+  grepping the actual built QEMU source for any DAX-related code:
+  zero matches). Matching OrbStack there would mean designing a bespoke
+  protocol extension with no reference implementation, for a custom
+  QEMU fork rather than something achievable in riftlessfsd alone --
+  inconsistent with this project's goal of working with ordinary,
+  unpatched QEMU. **Honest current conclusion: random read's gap may be
+  a genuine architectural ceiling of the portable-vhost-user-fs-over-
+  standard-QEMU approach**, not a bug waiting to be fixed -- the last
+  concrete, actionable idea for it (concurrency/pipelining differences)
+  is a weaker bet than any of the ones already eliminated, and it may
+  be that this specific metric simply isn't winnable without a much
+  larger scope change. See BENCHMARKS.md for the full reasoning and
+  what's still worth trying.
 
 ## How this was actually verified
 

@@ -384,6 +384,53 @@ value was convenient for a quick correctness check.
   enough now to treat as a real, if secondary, gap rather than pure
   noise, though still not tied to a specific identified cause.
 
+### What OrbStack's random-read number implies about its transport
+
+A true `iodepth=1` random-read `fio` job (like this suite's) is
+synchronous: each `read()` call blocks until the previous one
+completes, so IOPS translates directly into an implied per-request
+latency (`1 / IOPS` seconds). Doing that arithmetic on the v6 numbers:
+
+- OrbStack: ~1067 MiB/s at 4 KiB blocks -> ~273,000 IOPS -> **~3.7 us
+  implied per-request latency**.
+- riftlessfs: ~69.5 MiB/s at 4 KiB blocks -> ~17,800 IOPS -> **~56 us
+  implied per-request latency** (consistent, same order of magnitude,
+  with the ~120 us figure measured directly by tracing in "Where the
+  per-request latency actually goes" below and in the `virtiofsd`
+  comparison -- both point at a round-trip cost in the tens-to-low-
+  hundreds of microseconds for this class of transport).
+
+**~3.7 microseconds is not a plausible round-trip time for a real
+message exchange with a separate userspace process**, through *any*
+vhost-user-style mechanism -- a VM exit, a context switch into a
+different process, that process doing work and replying, a VM entry,
+and the guest kernel resuming, even highly optimized, costs tens of
+microseconds at minimum on real virtualization hardware (this is
+exactly what the `virtiofsd` comparison measured directly: ~120 us,
+and separately confirmed that riftlessfsd's own share of that is only
+~2 us -- the rest is inherent to the round-trip mechanism itself, not
+either backend's implementation). ~3.7 us *is*, however, a very
+plausible cost for a guest-side page fault against host memory that's
+directly mapped into the guest's address space -- i.e., DAX-style
+shared memory, where a "read" becomes a plain memory access (with the
+underlying page potentially already resident, or populated by a fault
+handler) rather than a message sent to and answered by a separate
+process.
+
+This is strong, quantitative (not just "it's probably fancier")
+evidence that OrbStack's random-read advantage specifically comes from
+*not paying a per-request round-trip cost at all* for reads, rather
+than from a faster or more efficient version of the same
+request/response mechanism riftlessfs and virtiofsd both use. If
+that's right, no amount of protocol-level tuning on riftlessfs's
+current transport (larger requests, zero-copy, fewer syscalls) can
+close this specific gap -- all of those still pay the same per-request
+round-trip tax this arithmetic says OrbStack has largely eliminated.
+Matching it would require riftlessfs to implement the same category of
+mechanism (DAX/shared-memory reads, `Next steps` item below), which is
+a materially larger undertaking than anything implemented in this
+project so far -- not a specific missing flag or constant.
+
 ## Where the per-request latency actually goes (and a negative result)
 
 The earlier hypothesis here was that `Server::process_vring`/`Server::run`
@@ -780,44 +827,41 @@ answer to how much it mattered here.
 
 ## Next steps (in priority order)
 
-Reordered after Fix 5: random read against **OrbStack specifically** is
-now the clearest, most-eliminated-alternatives-remaining gap, so it
-leads. The virtiofsd-comparison items below it are still worth doing
-(zero-copy I/O is a legitimate improvement regardless), but should be
-understood as *feeding into* the OrbStack question, not an end in
-themselves -- see the top-level reminder that beating virtiofsd was
-never the actual goal.
+Reordered again after the latency-arithmetic analysis above: it's now
+a specific, quantitative, *not yet acted on* hypothesis that random
+read's gap is transport-level (DAX/shared-memory vs. per-request
+round trips), not something the current protocol-tuning playbook
+(request size, batching limits, zero-copy) can close -- so validating
+or implementing that belongs above further tuning of the current
+transport, even though it's the largest undertaking on this list.
+Zero-copy I/O is still worth doing (bounded, safe, useful for CPU
+efficiency and whatever fraction of the write-side gaps it does
+explain), just not expected to move random read specifically anymore.
 
-1. **Profile random read specifically against OrbStack, the same way
-   sequential write was just profiled against it here** (trace-based,
-   not another flag guess) -- request-size, syscall cost, and VM memory
-   sizing are all now ruled out (see "What's still behind" above), so
-   the next candidates are the same ones identified against virtiofsd:
-   external round-trip latency (already shown to be transport-bound,
-   but not yet compared *specifically* against whatever OrbStack's
-   transport achieves) and the zero-copy-vs-heap-buffer difference
-   below. Item 2 is the concrete first move here.
-2. **Implement zero-copy read/write paths in riftlessfsd**, building
-   `iovec`s directly from `chain.readable`/`chain.writable`'s
-   guest-memory slices and using `preadv`/`pwritev` instead of
-   `Virtqueue::gather_readable`/`scatter_writable`'s current
+1. **Investigate DAX/shared-memory-style reads for real**, now backed
+   by a specific number to validate against rather than "OrbStack is
+   probably fancier": if a working implementation doesn't get
+   random-read's per-request latency down from ~56 us into single-digit
+   microseconds, the DAX hypothesis itself was wrong and needs revisiting,
+   not just an implementation detail. This is a materially larger
+   undertaking than anything else in this project so far (vhost-user
+   shared-memory-region negotiation, `FUSE_SETUPMAPPING`/
+   `REMOVEMAPPING` support that riftlessfsd doesn't have at all today,
+   and real security-surface implications of mapping host memory
+   directly into a guest) -- likely worth its own design pass before
+   writing code, not a quick follow-up.
+2. **Implement zero-copy read/write paths in riftlessfsd** in the
+   meantime, building `iovec`s directly from `chain.readable`/
+   `chain.writable`'s guest-memory slices and using `preadv`/`pwritev`
+   instead of `Virtqueue::gather_readable`/`scatter_writable`'s current
    copy-through-`Vec<u8>` approach -- confirmed via virtiofsd's own
-   source to be a real structural difference (see above), a legitimate
-   improvement regardless of how much of any specific gap it explains,
-   and re-measure afterward against **both** virtiofsd (via
-   `compare-virtiofsd.yml`/`syscall-cost-compare.yml`) and OrbStack (via
-   this document's own methodology) to quantify the actual effect on
-   the metric that matters, not just the diagnostic one.
-3. If that doesn't move random read, **look for concurrency/pipelining
-   differences** -- given syscall-level costs and counts are already
-   confirmed nearly identical to virtiofsd's, but overall write
-   throughput still differs there, something about how many requests
-   each backend can have genuinely in flight/overlapping at once (not
-   just batched-but-processed-sequentially, which riftlessfsd already
-   does -- see `Server::process_vring`'s docs) is a candidate
-   explanation worth checking against OrbStack too, though nothing
-   concrete has been found here yet.
-4. **Add more repeatability to this benchmark suite.** Fix 5 already
+   source to be a real structural difference (see above), bounded and
+   safe (no protocol changes, no new attack surface, unlike DAX), and
+   a legitimate improvement on its own terms even now that it's not
+   expected to be *the* answer to random read. Re-measure afterward
+   against both virtiofsd and OrbStack to get a real number instead of
+   an assumption either way.
+3. **Add more repeatability to this benchmark suite.** Fix 5 already
    added 3-run min/avg/max reporting for the OrbStack comparison (a
    real improvement over the historical single run), but 3 is still a
    small sample -- and the `-smp` confound encountered while
@@ -826,7 +870,7 @@ never the actual goal.
    Worth scripting the whole OrbStack comparison (both sides,
    N repeats, VM parameters pinned explicitly) rather than doing it by
    hand each time.
-5. **Consider whether `read_ahead_kb` is worth tuning/documenting from
+4. **Consider whether `read_ahead_kb` is worth tuning/documenting from
    riftlessfsd's side.** Confirmed to be the actual governing factor for
    sequential read chunk size (see above), is a guest-side setting
    riftlessfsd doesn't currently influence at all, and defaults to a
@@ -834,14 +878,19 @@ never the actual goal.
    ceiling already advertised -- there may be real headroom here, same
    category of fix as Fix 5's memory-sizing finding (a guest/deployment
    tunable, not a protocol change).
-6. **Revisit attribute cache and `FOPEN_KEEP_CACHE` policy once there's
+5. **Revisit attribute cache and `FOPEN_KEEP_CACHE` policy once there's
    real cache invalidation.** Both are currently unconditional with no
    active invalidation (e.g. on a rename/unlink another client might
    have cached, or a host-side write outside riftlessfsd), which matters
    more with multiple guests or host-side writers involved.
-7. **Investigate DAX/shared-memory-style reads** if (1) doesn't turn up
-   a more targeted explanation -- a materially larger undertaking than
-   anything done so far.
+6. If DAX turns out infeasible or doesn't pan out as hypothesized,
+   **look for concurrency/pipelining differences** as a fallback --
+   given syscall-level costs and counts are already confirmed nearly
+   identical to virtiofsd's, but overall write throughput still
+   differs there, something about how many requests each backend can
+   have genuinely in flight/overlapping at once is a candidate worth
+   checking against OrbStack too, though nothing concrete has been
+   found here yet.
 
 "riftlessfs beats OrbStack" is still not a true statement overall --
 **random read remains 15x behind**, by a margin nothing tried so far
@@ -857,8 +906,10 @@ document has tried to make a habit of, same as the sequential-read and
 `pwrite`-cost dead ends recorded above. Three of five benchmark
 categories (random write, sequential write, and -- more provisionally
 -- sequential read) are now either ahead or within reach; one category
-(metadata) is a stable, secondary, ~4-5x gap; and one (random read) is
-the clear, isolated, still-unexplained remainder. That's a materially
-more specific and more encouraging state than "still behind" implies,
-even though it remains true. This file is where the OrbStack claim
-gets re-evaluated honestly as more of the above lands.
+(metadata) is a stable, secondary, ~4-5x gap; and one (random read) has
+a specific, quantitative, but *not yet validated or acted on*
+hypothesis (DAX/shared-memory reads bypassing the per-request round
+trip entirely -- see above) rather than being a mystery. That's a
+materially more specific and more encouraging state than "still
+behind" implies, even though it remains true. This file is where the
+OrbStack claim gets re-evaluated honestly as more of the above lands.

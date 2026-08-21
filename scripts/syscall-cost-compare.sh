@@ -279,11 +279,13 @@ echo "syscall timing (strace -T, wall time per call):"
 echo "============================================================"
 # riftlessfsd uses plain pwrite()/pread() (see
 # riftlessfs-core::passthrough); virtiofsd (fuse-backend-rs) uses
-# vectored I/O (pwritev64/preadv64) instead, discovered by this
-# script's own diagnostic fallback on its first run against real
-# hardware -- see BENCHMARKS.md. Trying both forms for both binaries
-# rather than hardcoding what each *currently* does.
-summarize "riftlessfsd" "$WORKDIR/riftless-strace.log" pwrite64 pwrite pwritev64 pwritev
-summarize "riftlessfsd" "$WORKDIR/riftless-strace.log" pread64 pread preadv64 preadv
-summarize "virtiofsd  " "$WORKDIR/virtiofsd-strace.log" pwritev64 pwritev pwrite64 pwrite
-summarize "virtiofsd  " "$WORKDIR/virtiofsd-strace.log" preadv64 preadv pread64 pread
+# vectored I/O -- specifically `pwritev2` (not `pwritev`/`pwritev64`)
+# and `preadv` (not `preadv64`) -- instead, discovered by this script's
+# own diagnostic fallback across its first two runs against real
+# hardware -- see BENCHMARKS.md. Trying multiple forms for both
+# binaries rather than hardcoding only what each is *currently* known
+# to call.
+summarize "riftlessfsd" "$WORKDIR/riftless-strace.log" pwrite64 pwrite pwritev2 pwritev pwritev64
+summarize "riftlessfsd" "$WORKDIR/riftless-strace.log" pread64 pread preadv preadv64
+summarize "virtiofsd  " "$WORKDIR/virtiofsd-strace.log" pwritev2 pwritev pwritev64 pwrite64 pwrite
+summarize "virtiofsd  " "$WORKDIR/virtiofsd-strace.log" preadv preadv64 pread64 pread

@@ -400,16 +400,83 @@ exactly what the write-side trace showed: fewer/larger writes where the
 access pattern has real locality, no effect on random writes, and (now
 confirmed) no effect on reads of any pattern.
 
+### A candidate explanation for the random-write gap: `pwrite()` itself, not our protocol handling
+
+With request-size mismatch ruled out twice over, the next question was
+whether the gap lives in riftlessfsd's own request handling at all, or
+purely in the external transport (already shown to be at parity for
+reads). `Server::process_vring`'s per-request trace was extended to
+include the opcode (`fuse::wire::Opcode`, peeked directly from the
+gathered request's header rather than re-parsing it) so WRITE and READ
+requests' *own* total processing time -- everything except the external
+VM-exit/scheduler wait already shown to be transport-bound -- could be
+compared directly, on top of the existing per-syscall `pwrite`/`pread`
+timing.
+
+Running matched 4 KiB random-write and random-read fio jobs against a
+local riftlessfsd (real QEMU/HVF guest, same setup as the earlier
+tracing) and comparing:
+
+| | avg. total request processing time | avg. `pwrite`/`pread` syscall time alone |
+|---|---|---|
+| WRITE (4 KiB) | 12.0 us | 8.03 us |
+| READ (4 KiB) | 4.3 us | 1.46 us |
+
+**`pwrite()` itself is ~5.5x slower than `pread()` for the same 4 KiB
+size on this host filesystem, and that syscall-time difference (6.6 us)
+accounts for ~85% of the total per-request processing time gap (7.7
+us).** This isn't a FUSE-protocol-level or riftlessfsd-specific cost --
+it's the underlying host filesystem call itself (write path: dirty page
+tracking, inode mtime update, journaling; read path: none of that) --
+but it matters a lot more for *throughput* than the read-latency
+comparison suggested, for a specific reason: `Server::process_vring`
+drains and processes an entire batch of available requests
+back-to-back before paying the external wake-up cost again (see its
+docs) -- confirmed earlier to be large for random write specifically
+(100-200+ requests per wake-up, from the writeback-batching trace).
+Within a batch, total time is dominated by *N times the per-request
+internal processing time*, not by the external per-request latency
+that dominates a single request's round trip -- so a syscall that's
+slower per-call becomes a real, cumulative throughput cost precisely in
+the batched-many-small-requests case, and much less so for reads (no
+equivalent write-back batching mechanism drives large batches of small
+reads) or for sequential writes (far fewer, much larger `pwrite` calls
+for the same data volume, so the *fixed* per-syscall overhead -- as
+opposed to the per-byte cost -- gets amortized over more data). That
+gradient (fixed per-syscall cost mattering more, the smaller and more
+numerous the requests) is at least directionally consistent with
+random write's larger observed gap (~3.3x) versus sequential write's
+smaller one (~2.1x).
+
+**This is a real, measured local fact, not yet confirmed as *the*
+explanation for the CI-measured gap** -- two things are missing before
+treating it as settled, in light of the sequential-read lesson just
+above: (1) this was measured on the local macOS/APFS dev host, not the
+actual Linux/ext4 comparison hardware, and host filesystem write-vs-read
+asymmetry could plausibly differ in magnitude or even direction there;
+(2) it's only riftlessfsd's own syscall timing -- there's no equivalent
+measurement yet of virtiofsd's own `pwrite`/`pread` timing on the same
+host filesystem, so it's not yet known whether virtiofsd pays the same
+per-syscall cost and simply amortizes it better (e.g. via a genuinely
+different I/O mechanism), or avoids much of it entirely.
+
 ## Next steps (in priority order)
 
-1. **Investigate the *random write* gap specifically**, now that two
-   independent protocol-level explanations (`max_write`, `max_pages`)
-   have been checked and fixed on our side without closing it -- profile
-   it the same way the random-read latency investigation was done above
-   (per-request backend timing already exists via `log::trace!` in
-   `fuse::dispatch::Session::handle`; what's missing is doing the same
-   for the *transport* side of a real random-write run specifically),
-   rather than guessing at another flag or constant to tweak.
+1. **Confirm (or refute) the `pwrite`-vs-`pread` syscall-cost theory on
+   the actual comparison hardware** -- the current best explanation for
+   the random-write gap, but not yet confirmed there. Two things
+   needed: (a) run the same opcode-aware trace against a Linux/ext4 host
+   (e.g. as an extra, separate step in `compare-virtiofsd.yml` -- not
+   folded into the main benchmarked run itself, since trace-level
+   logging overhead would unfairly slow down riftlessfsd's own
+   *benchmarked* numbers) to see if the same asymmetry exists there;
+   (b) get an equivalent measurement for virtiofsd itself (e.g. via
+   `strace -T -e trace=pwrite64,pread64` around a short run, since it
+   has no equivalent built-in trace logging) to see whether it pays a
+   similar per-syscall cost or avoids it via a different write path. If
+   neither confirms the theory, fall back to profiling the *transport*
+   side of a real random-write run the way the random-read investigation
+   profiled reads, rather than guessing at another flag or constant.
 2. **Add repeatability to this benchmark suite**: multiple runs with
    variance reported. The run-to-run noise between the two virtiofsd
    comparison runs above (visible in both backends' absolute numbers,

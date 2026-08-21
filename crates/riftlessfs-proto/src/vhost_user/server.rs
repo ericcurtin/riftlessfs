@@ -16,6 +16,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::error::{ProtoError, ProtoResult};
 use crate::fuse::dispatch::{Reply, Session};
+use crate::fuse::wire::Opcode;
 
 use super::connection::Connection;
 use super::header::{MsgHeader, Request};
@@ -179,13 +180,32 @@ impl Server {
             // BENCHMARKS.md's random-I/O discussion.
             let t0 = std::time::Instant::now();
             let request = vq.gather_readable(mem, &chain)?;
+            // `fuse_in_header.opcode` is the second u32 (bytes 4..8),
+            // right after `len` -- peeked directly rather than doing a
+            // full `InHeader::from_bytes` parse here, purely so this
+            // trace line can distinguish opcodes without duplicating
+            // dispatch's own parsing. Used to compare our own
+            // (non-syscall) per-request overhead between opcodes at
+            // matching sizes -- e.g. WRITE vs READ -- as part of the
+            // random-write investigation in BENCHMARKS.md: per-request
+            // `pwrite`/`pread` timing already isolates the syscall
+            // itself (see `fuse::dispatch::Session::handle`), so this is
+            // what's needed to see whether the *rest* of our own
+            // request handling differs between the two.
+            let opcode = request
+                .get(4..8)
+                .map(|b| Opcode::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+                .unwrap_or(Opcode::Unknown(0));
             let reply = self.session.handle(&request);
             let written = match reply {
                 Reply::Bytes(bytes) => vq.scatter_writable(mem, &chain, &bytes)?,
                 Reply::None => 0,
             };
             vq.push_used(mem, head, written)?;
-            log::trace!("vring {idx}: request processed in {:?}", t0.elapsed());
+            log::trace!(
+                "vring {idx}: {opcode:?} request processed in {:?}",
+                t0.elapsed()
+            );
             processed += 1;
         }
 
